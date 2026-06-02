@@ -1,0 +1,10 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Bundles are attached to GitHub Releases, never committed here
+SpeculorSDK-*.tar.gz
+SpeculorSDK-*.zip

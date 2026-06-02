@@ -1,0 +1,140 @@
+Speculor Plugin SDK License
+============================
+
+Copyright (c) 2026 Fabio Barros. All rights reserved.
+
+This License governs Your use of the Speculor Plugin SDK, including the header
+files, pre-built static and shared libraries (including `speculor_sdk`,
+`spclib`, `speculor_gpu`, and the GPU helper headers in `plugins/common/gpu`),
+CMake helper modules, sample code, and documentation distributed in this
+repository or in any binary release labeled as the "Speculor SDK"
+(collectively, the "SDK"). By copying, installing, or otherwise using the SDK,
+You agree to be bound by this License.
+
+The SDK is licensed, not sold. Fabio Barros ("Licensor") retains all right,
+title, and interest in and to the SDK, including all intellectual property
+rights. No rights are granted to You other than those expressly set out below.
+
+1. Grant for Plugin Development
+-------------------------------
+
+Subject to Your continuous compliance with this License, Licensor grants You a
+non-exclusive, non-transferable, non-sublicensable, royalty-free, worldwide
+license to:
+
+  (a) install and use the SDK on hardware You own or lawfully control;
+
+  (b) compile and link Your own software ("Your Plugin") against the SDK
+      headers and the SDK's pre-built libraries, solely to produce a
+      dynamically-loaded plugin module that interoperates with the Speculor
+      engine through the documented plugin C ABI; and
+
+  (c) reproduce and redistribute, in source or binary form and under any
+      license of Your choosing (including a proprietary license, an
+      open-source license, or no license at all), the unmodified SDK header
+      files that are #included by Your Plugin's public interface, and any
+      `*.def`, `*.cmake`, or sample-code files marked as redistributable in
+      the SDK documentation, in each case to the extent necessary to build
+      or distribute Your Plugin.
+
+Your Plugin is Your work product and is not subject to this License. Licensor
+claims no rights in Your Plugin.
+
+2. Restrictions
+---------------
+
+You will not, and will not permit any third party to:
+
+  (a) use the SDK to develop, build, run, or distribute any software other
+      than a plugin intended to load into the Speculor engine through the
+      documented plugin C ABI;
+
+  (b) redistribute the SDK's pre-built libraries, in whole or in part, as
+      a stand-alone product or as a component of any product other than
+      Your Plugin;
+
+  (c) modify, adapt, translate, port, or create derivative works of the
+      SDK's pre-built libraries;
+
+  (d) reverse-engineer, decompile, or disassemble any pre-built library
+      included in the SDK, except to the extent (and only to the extent)
+      that applicable law expressly permits such activity notwithstanding
+      this restriction;
+
+  (e) remove or alter any copyright, trademark, or proprietary notice in
+      the SDK; or
+
+  (f) use the SDK to develop a product that competes with the Speculor
+      engine itself, including a reimplementation of the Speculor engine
+      or a host application that loads Speculor plugins in lieu of the
+      Speculor engine.
+
+For the avoidance of doubt, distributing Your Plugin under a copyleft license
+(such as the GNU General Public License) is permitted by Section 1(c), but
+distributing the SDK's pre-built libraries themselves under such a license is
+not.
+
+3. Third-Party Components
+-------------------------
+
+The SDK incorporates third-party components subject to their own license
+terms, including LGPL-licensed components such as FFmpeg and Qt. Those terms
+are reproduced or referenced in the file `THIRD_PARTY_NOTICES.md` distributed
+with the SDK and prevail over this License with respect to those components
+only. Nothing in this License is intended to limit any right granted to You
+by a third-party license.
+
+4. Patents
+----------
+
+Subject to Your compliance with this License, Licensor grants You a
+non-exclusive, worldwide, royalty-free patent license, under Licensor's
+patent claims that are necessarily infringed by Your permitted use of the
+SDK, to make, have made, use, offer to sell, sell, and import Your Plugin.
+If You initiate or participate in any patent claim against Licensor or any
+of its affiliates or licensees alleging that the SDK or any plugin developed
+using the SDK constitutes patent infringement, the patent license granted to
+You under this Section 4 terminates as of the date the claim is filed.
+
+5. No Warranty
+--------------
+
+THE SDK IS PROVIDED "AS IS" AND WITHOUT WARRANTY OF ANY KIND, EXPRESS, IMPLIED,
+OR STATUTORY, INCLUDING WITHOUT LIMITATION ANY WARRANTY OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, OR TITLE. LICENSOR DOES
+NOT WARRANT THAT THE SDK WILL MEET YOUR REQUIREMENTS, OPERATE WITHOUT ERROR,
+OR REMAIN BACKWARDS-COMPATIBLE ACROSS VERSIONS.
+
+6. Limitation of Liability
+--------------------------
+
+IN NO EVENT WILL LICENSOR BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR FOR ANY LOST PROFITS, LOST
+DATA, OR INTERRUPTION OF BUSINESS, ARISING OUT OF OR RELATED TO THIS LICENSE
+OR THE SDK, EVEN IF LICENSOR HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+DAMAGES. LICENSOR'S AGGREGATE LIABILITY UNDER OR IN CONNECTION WITH THIS
+LICENSE WILL NOT EXCEED FIFTY UNITED STATES DOLLARS (US$50).
+
+7. Termination
+--------------
+
+This License terminates automatically if You breach any term. On termination,
+You must stop using the SDK and destroy all copies in Your possession. Sections
+2 through 8 survive termination. Termination does not require You to recall or
+destroy copies of Your Plugin that were distributed in compliance with this
+License prior to termination.
+
+8. Miscellaneous
+----------------
+
+This License is governed by the laws of the jurisdiction in which Licensor
+has its principal place of business, without regard to conflict-of-laws rules.
+If any provision is held unenforceable, the remainder of the License remains
+in effect. Licensor's failure to enforce a provision is not a waiver of that
+provision.
+
+------------------------------------------------------------------------------
+The Speculor engine and application are distributed under a separate license
+(see `speculor-app/LICENSE`). First-party plugins are distributed under their
+own license (see `speculor-plugins/LICENSE`). Third-party software incorporated
+into the SDK is governed by `THIRD_PARTY_NOTICES.md`.
