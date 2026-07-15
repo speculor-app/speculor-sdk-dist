@@ -5,6 +5,10 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Example build outputs
+build*/
+CMakeUserPresets.json
+
 # Bundles are attached to GitHub Releases, never committed here
 SpeculorSDK-*.tar.gz
 SpeculorSDK-*.zip
