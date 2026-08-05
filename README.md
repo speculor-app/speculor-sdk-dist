@@ -42,8 +42,14 @@ release. Check the release notes for ABI changes between cycles.
    project(my_plugin LANGUAGES CXX)
 
    find_package(SpeculorSDK REQUIRED)
+   include(PluginHelpers)      # spc_add_plugin()
+   include(CompilerWarnings)   # spc_set_warnings(), which spc_add_plugin calls
+
    spc_add_plugin(my_plugin SOURCES my_plugin.cpp)
    ```
+
+   Both `include()` lines are required: `find_package` only puts the bundle's
+   cmake directory on `CMAKE_MODULE_PATH`, it does not include the modules.
 
 3. **Configure** with `CMAKE_PREFIX_PATH` set to the extracted folder:
 
@@ -57,7 +63,9 @@ configured plugin shared library — no prefix, hidden visibility, RPATH wired f
 the bundled dependencies. Drop the resulting library into the host application's
 plugin directory to load it.
 
-A complete, buildable example is in [`examples/minimal-plugin/`](examples/minimal-plugin/).
+A complete project to copy — plugin, CMakeLists and a conformance test — is in
+[`templates/standalone-plugin/`](https://github.com/speculor-app/speculor-plugin-examples/tree/main/templates/standalone-plugin),
+where CI configures it on its own against each published bundle.
 
 ## Minimal plugin
 
@@ -245,11 +253,12 @@ entirely.
   guide: lifecycle, descriptor, parameters, frames, tables, signals, GPU compute
   and coalesced submit, two-phase shutdown, the watchdog contract, and the
   complete SDK reference.
-- [`examples/minimal-plugin/`](examples/minimal-plugin/) — a buildable
-  frame-in / frame-out filter, and the self-containment check for a bundle.
 - [speculor-plugin-examples](https://github.com/speculor-app/speculor-plugin-examples)
-  — larger example plugins (sources, filters, a Vulkan compute shader, an FFT
-  spectrometer).
+  — a [standalone project template](https://github.com/speculor-app/speculor-plugin-examples/tree/main/templates/standalone-plugin)
+  to copy, plus 13 example plugins (sources, filters, a Vulkan compute shader,
+  an FFT spectrometer). All of them run the SDK's conformance checks in CI
+  against the latest published bundle, so they are verified to load and honour
+  the ABI, not merely to compile.
 - Site · <https://speculor.app> · Docs · <https://speculor.app/docs> ·
   Community · <https://speculor.app/community>
 

@@ -1373,7 +1373,7 @@ The response callback is called on the node's own execution thread, separate fro
 
 ### Project Setup
 
-`find_package(SpeculorSDK REQUIRED)` resolves from the extracted bundle and brings in the `SpeculorSDK::` imported targets plus the `spc_add_plugin()` helper (from the bundled `PluginHelpers.cmake`). A complete plugin project is two files:
+`find_package(SpeculorSDK REQUIRED)` resolves from the extracted bundle and brings in the `SpeculorSDK::` imported targets. It does **not** define the helpers — it only appends the bundle's cmake directory to `CMAKE_MODULE_PATH`, so you include them yourself. A complete plugin project is two files:
 
 **`CMakeLists.txt`**
 
@@ -1382,8 +1382,13 @@ cmake_minimum_required(VERSION 3.24)
 project(my_plugin LANGUAGES CXX)
 
 find_package(SpeculorSDK REQUIRED)
+include(PluginHelpers)      # spc_add_plugin(), spc_add_plugin_test(), spc_enable_gpu()
+include(CompilerWarnings)   # spc_set_warnings(), which spc_add_plugin calls internally
+
 spc_add_plugin(my_plugin SOURCES my_plugin.cpp)
 ```
+
+Both includes are required. Omitting `PluginHelpers` makes `spc_add_plugin` an unknown command; omitting `CompilerWarnings` fails *inside* `spc_add_plugin` on `spc_set_warnings`, which is a more confusing error because it points into the bundle rather than at your own CMakeLists.
 
 Configure with `CMAKE_PREFIX_PATH` pointing at the extracted bundle:
 
