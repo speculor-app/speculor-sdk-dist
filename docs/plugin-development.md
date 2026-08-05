@@ -1429,6 +1429,83 @@ target_link_libraries(my_plugin PRIVATE SpeculorSDK::spclib)
 
 ---
 
+## Testing Your Plugin
+
+The bundle ships a header-only test harness under `include/speculor_common/testing/`. It loads a **built** plugin the way the host does — through its exported `spc_plugin_vtable` — so it exercises the real ABI boundary rather than calling your functions directly. Nothing about it is Speculor-specific at build time: there is no test framework to adopt, and the checks return a report instead of asserting, so they drop into Catch2, GoogleTest, or a bare `main`.
+
+| Header | What it gives you |
+|---|---|
+| `<testing/plugin_under_test.h>` | `PluginUnderTest` — RAII load/unload, `create()`/`start()`/`stop()`, parameter and `process()` calls |
+| `<testing/fake_host.h>` | `FakeHost` — an `SpcHostServices` stand-in with a frame pool, captured logs, and a controllable clock |
+| `<testing/conformance.h>` | `run_conformance()` — the checks every plugin must satisfy |
+
+### Conformance
+
+`run_conformance()` is the floor. It verifies the things the host relies on and that are easy to get subtly wrong:
+
+- `struct_size` matches the vtable the SDK was built with, and the required slots are non-null
+- descriptor strings are NUL-terminated inside their fixed buffers, and counts are within `SPC_PORT_MAX` / `SPC_PLUGIN_PARAM_MAX`
+- every declared parameter is readable by name via `get_parameter` and reports the type it was declared with
+- parameter defaults sit inside their own declared ranges, and names are unique
+- `set_parameter` **rejects** an undeclared name rather than returning `SPC_OK` — otherwise "applied" and "silently ignored" are indistinguishable to the caller, and a typo in a project file becomes a setting that never takes effect
+- create → start → request_stop → stop survives, and a **second** `stop()` is safe, because the host can stop a node that already stopped itself after a fatal error
+
+A runner is about twenty lines, and takes the plugin path as `argv[1]`:
+
+```cpp
+#include <testing/conformance.h>
+#include <testing/plugin_under_test.h>
+#include <cstdio>
+
+int main(int argc, char** argv) {
+    if (argc < 2) { std::fprintf(stderr, "usage: %s <plugin>\n", argv[0]); return 2; }
+
+    spc::testing::PluginUnderTest plugin;
+    if (!plugin.load(argv[1])) {
+        std::fprintf(stderr, "FAIL: %s\n", plugin.error().c_str());
+        return 1;
+    }
+    const auto report = spc::testing::run_conformance(plugin);
+    std::printf("%s\n", report.summary().c_str());   // lists every failure
+    return report.ok() ? 0 : 1;
+}
+```
+
+### Registering it
+
+`spc_add_plugin_test()` builds the runner against the SDK, resolving includes and libraries from the bundle and linking `dl` where `dlopen` needs it. Register **one `add_test` per plugin**, so a failure names the plugin instead of reporting that "the tests" broke:
+
+```cmake
+enable_testing()
+
+spc_add_plugin_test(my_plugin_tests SOURCES conformance_runner.cpp PLUGINS my_plugin)
+add_test(NAME conformance.my_plugin COMMAND my_plugin_tests $<TARGET_FILE:my_plugin>)
+set_tests_properties(conformance.my_plugin PROPERTIES TIMEOUT 120)
+```
+
+Each `PLUGINS` target becomes a build dependency and an `SPC_PLUGIN_<NAME>` compile definition. Naming a target that does not exist is a hard configure error, not a skipped test. Then `ctest --test-dir build --output-on-failure`.
+
+### Beyond conformance
+
+Conformance proves your plugin loads and answers the ABI honestly. It cannot tell whether it does its job — that needs a test written against your own contract, using `FakeHost` to supply host services and `PluginUnderTest::process()` to push data through:
+
+```cpp
+spc::testing::FakeHost host;
+plugin.set_host_services(host.services());
+plugin.create();
+plugin.start();
+
+SpcData in{};   /* fill in your input */
+SpcData out{};
+plugin.process(&in, 1, &out, 1);   // then assert on `out`
+```
+
+Install host services **before** `start()`. That is the only order the host produces — node setup installs them, then starts the node — so a plugin that dereferences them in `start()` is correct to do so, and starting without them tests a sequence that cannot occur.
+
+If your plugin needs hardware, the no-device paths are still worth covering, and are where bugs concentrate: scanning with nothing attached, starting with no device selected, and the shutdown sequence. A plugin that blocks forever in `stop()` when the device vanished is a real failure mode, and it reproduces without the device.
+
+---
+
 ## Complete Example: A Streaming Counter Source
 
 This example shows a more complex plugin that generates frames with a counter overlay. It demonstrates custom create/destroy, side effects in `set_parameter`, start/stop lifecycle, frame allocation with pool fallback, and logging. It is a generator, so it carries `.data_source()` — its output originates outside the pipeline's dataflow, which is what makes it recordable and replayable.
