@@ -594,7 +594,7 @@ if (out) {
 }
 ```
 
-Always handle the fallback case — `acquire_frame` may return `nullptr` if the pool is exhausted. If you acquire a frame but decide not to use it as output, release it with `s->host.release_frame(frame)`.
+Always handle the fallback case — `acquire_frame` may return `nullptr` if the pool is exhausted. If you acquire a frame but decide not to use it as output, release it with `s->host.release_frame(frame)`. A frame you put on an output belongs to the engine from then on, whatever `process()` returns: if it then fails, the engine puts the frame back in the pool, so don't keep using it.
 
 ### GPU Compute Plugins
 
