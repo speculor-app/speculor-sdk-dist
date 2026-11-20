@@ -1,91 +1,93 @@
 # Plugin Development Guide
 
-Speculor plugins are shared libraries (`.dll` / `.so` / `.dylib`) that export a C ABI vtable. The host application discovers them at runtime in its plugin directory, so plugins can be built independently and dropped in without recompiling the host.
+A Speculor plugin is a shared library (`.dll` / `.so`) that exports one C object, `spc_plugin`. The host finds plugins in its plugin directory at run time, so a plugin is built on its own and dropped in.
 
-This guide walks through plugin development from a minimal example to advanced patterns. You will need:
+This guide describes SDK 0.59.0, whose plugin ABI number is `SPC_ABI` 59. You need:
 
-- A C++20 compiler (MSVC 19.30+, GCC 12+, Clang 15+)
-- CMake 3.24+
-- An extracted **Speculor SDK bundle** — download it from the [Releases](https://github.com/speculor-app/speculor-sdk-dist/releases/latest) page. The bundle is fully self-contained: headers, prebuilt libraries, every dependency, and a standalone CMake package config. Nothing else is required.
+- A C++20 compiler (MSVC 19.30+, GCC 12+, Clang 15+) for the SDK's C++ conveniences, or a C11 compiler for a plugin written against the C header alone.
+- CMake 3.24+.
+- An extracted **Speculor SDK bundle** from the [Releases](https://github.com/speculor-app/speculor-sdk-dist/releases/latest) page. It holds the headers, the prebuilt libraries, every dependency and a CMake package config. Nothing else is needed.
 
-Point CMake at the extracted bundle and pull the SDK in with `find_package`:
+Header paths in this guide are relative to the bundle's include directories: `speculor/...` for the SDK headers (`include/speculor/`), and unprefixed paths such as `gpu/gpu_host.h`, `cv_helpers.h` or `testing/conformance.h` for the shared plugin headers (`include/speculor_common/`), which `spc_add_plugin()` puts on your include path.
 
-```cmake
-cmake_minimum_required(VERSION 3.24)
-project(my_plugin LANGUAGES CXX)
-
-find_package(SpeculorSDK REQUIRED)
-spc_add_plugin(my_plugin SOURCES my_plugin.cpp)
-```
-
-```bash
-cmake -B build -G Ninja -DCMAKE_PREFIX_PATH=/path/to/extracted/SpeculorSDK-<version>-<os>-<arch>
-cmake --build build
-```
-
-Header paths in this guide are relative to the bundle's include directories: `speculor/...` for the public SDK API (`include/speculor/`), and unprefixed paths such as `gpu/...`, `spc_clock.h`, or `cv_helpers.h` for the shared plugin headers (`include/speculor_common/`, added to your include path by `spc_add_plugin()`).
-
-All plugin code uses a single include:
-
-```cpp
-#include <speculor/plugin_helpers.h>
-```
-
-This pulls in the C ABI definitions (`plugin_api.h`), logging macros (`plugin_log.h`), and the C++ convenience layer. Your plugin code lives entirely inside the shared library — the helpers are header-only and do not affect the ABI boundary.
+The [speculor-plugin-examples](https://github.com/speculor-app/speculor-plugin-examples) repository holds 13 example plugins and a standalone project template. Every sample here follows them.
 
 ---
 
 ## Your First Plugin
 
-Here is a complete plugin that outputs a constant scalar value. It uses all three convenience macros and compiles to about 20 lines:
+A plugin that outputs a constant scalar, set by its one parameter:
 
 **`scalar_source_plugin.cpp`**
 
 ```cpp
-#include <speculor/plugin_helpers.h>
+#include <speculor/plugin.h>          // the boundary: every type and call that crosses it
+#include <speculor/plugin_helpers.h>  // conveniences compiled into the plugin
 
-// 1. define your state struct
-struct ScalarSourceState {
-    spc::HostServices host;      // host services (logging, frame alloc)
-    float value = 0.0f;          // the parameter we expose
+#include <new>
+
+// The parameters in declaration order. start() and params_changed() get the
+// values as one array in this order, so a value's position is its identity.
+enum Param : uint32_t {
+    P_VALUE,
 };
 
-// 2. generate create/destroy/state()/set_host_services()
-SPC_PLUGIN(ScalarSourceState, host)
-
-// 3. declare the descriptor (metadata, ports, parameters)
+// SPC_PLUGIN_DESCRIPTOR defines info(), which builds the node info on its
+// first call and keeps it while the library is loaded.
 SPC_PLUGIN_DESCRIPTOR(
-    spc::DescriptorBuilder("scalar_source", "Scalar Source", "Sources")
-        .static_source()
-        .author("Speculor").version("0.1.0")
-        .description("Outputs a constant scalar value")
-        .float_param("value", "Value", -1e6f, 1e6f, 0.0f, 0.1f)
+    spc::DescriptorBuilder("scalar_source", "Scalar Source", "Sources/General")
+        .run_on_change()
+        .author("You").version("0.1.0")
+        .help("Outputs a constant scalar value")
+        .float_param("value", "Value", -1e6f, 1e6f, 0.0f, 0.1f)   // P_VALUE
+            .param_help("Constant scalar value to output")
         .output("scalar_out", "Scalar", SPC_DATA_SCALAR)
 )
 
-// 4. generate set_parameter() and get_parameter() from bindings
-SPC_PLUGIN_AUTO_PARAMS(ScalarSourceState,
-    SPC_BIND_FLOAT(ScalarSourceState, "value", value)
-)
+struct ScalarSourceState {
+    float value = 0.0f;
+};
 
-// 5. implement process — read inputs, write outputs
-static int process(SpcPluginInstance* inst, const SpcData* /*inputs*/,
-                   uint32_t /*input_count*/, SpcData* outputs,
-                   uint32_t output_count) {
-    if (output_count < 1) return -1;
-    spc::set_scalar_output(outputs[0], state(inst)->value);
-    return 0;
+static ScalarSourceState* state(SpcPluginInstance* instance)
+{
+    return reinterpret_cast<ScalarSourceState*>(instance);
 }
 
-// 6. export the vtable
-SPC_PLUGIN_VTABLE(
-    .get_descriptor    = get_descriptor,
-    .create_instance   = create_instance,
-    .destroy_instance  = destroy_instance,
-    .set_parameter     = set_parameter,
-    .get_parameter     = get_parameter,
-    .process           = process,
-    .set_host_services = set_host_services
+static SpcPluginInstance* start(SpcHost* /*host*/, const SpcValue* values)
+{
+    auto* s = new (std::nothrow) ScalarSourceState{};
+    if (!s) return nullptr;
+    s->value = values[P_VALUE].f;   // a FLOAT value is in .f
+    return reinterpret_cast<SpcPluginInstance*>(s);
+}
+
+static void stop(SpcPluginInstance* instance)
+{
+    delete state(instance);
+}
+
+static void params_changed(SpcPluginInstance* instance, const SpcValue* values,
+                           uint64_t /*changed*/)
+{
+    state(instance)->value = values[P_VALUE].f;
+}
+
+static int process(SpcPluginInstance* instance, SpcStep* step)
+{
+    SpcData& out = step->outputs[0];
+    out.type = SPC_DATA_SCALAR;
+    out.scalar = {};   // timestamp_ns and sequence 0: the engine stamps them
+    out.scalar.type = SPC_FIELD_FLOAT;
+    out.scalar.f32 = state(instance)->value;
+    return SPC_OK;
+}
+
+SPC_EXPORT_PLUGIN(
+    .info           = info,
+    .start          = start,
+    .stop           = stop,
+    .process        = process,
+    .params_changed = params_changed
 )
 ```
 
@@ -94,1301 +96,990 @@ SPC_PLUGIN_VTABLE(
 ```cmake
 cmake_minimum_required(VERSION 3.24)
 project(scalar_source LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(SpeculorSDK REQUIRED)
+include(PluginHelpers)      # spc_add_plugin(), spc_add_plugin_test(), spc_enable_gpu()
+include(CompilerWarnings)   # spc_set_warnings(), which spc_add_plugin() calls
+
 spc_add_plugin(scalar_source SOURCES scalar_source_plugin.cpp)
 ```
 
-Line-by-line breakdown:
+```bash
+cmake -B build -G Ninja -DCMAKE_PREFIX_PATH=/path/to/SpeculorSDK-<version>-<os>-<arch>
+cmake --build build
+```
 
-- **`SPC_PLUGIN(ScalarSourceState, host)`** generates four functions: `state()` (cast helper), `create_instance()`, `destroy_instance()`, and `set_host_services()`. The second argument is the name of the `spc::HostServices` member in your state struct.
-- **`SPC_PLUGIN_DESCRIPTOR(...)`** generates a `get_descriptor()` function with thread-safe lazy initialization. The `DescriptorBuilder` fluent API sets metadata, ports, and parameters. Pass the builder expression directly — the macro calls `build_into()` for you, so do **not** terminate the chain with a `build()` call.
-- **`SPC_PLUGIN_AUTO_PARAMS(...)`** generates `set_parameter()` and `get_parameter()` by binding parameter names directly to struct fields.
-- **`SPC_PLUGIN_VTABLE(...)`** exports the `spc_plugin_vtable` symbol using C++20 designated initializers — list only the slots you implement, the rest default to `nullptr`. Fields must appear in `SpcPluginVTable` declaration order (`plugin_api.h`).
+Copy the built `scalar_source.dll` / `scalar_source.so` into the application's plugin directory.
+
+What each part does:
+
+- **`SPC_PLUGIN_DESCRIPTOR(...)`** defines `info()`, the plugin's `info` slot. `DescriptorBuilder` fills the node info: what the plugin is, its ports and its parameters. Pass the builder expression as it is; the macro builds it.
+- **`start(host, values)`** makes an instance when the node starts. It gets the node's host and every parameter value, and returns the instance, or null when the node cannot run.
+- **`stop(instance)`** tears the instance down and frees it.
+- **`params_changed(instance, values, changed)`** tells a running instance the values again when one changes.
+- **`process(instance, step)`** runs one step: it reads `step->inputs` and fills `step->outputs`.
+- **`SPC_EXPORT_PLUGIN(...)`** defines `spc_plugin` from the slots listed. A slot left out is null: a call the plugin does without.
 
 ---
 
-## How It Works
+## The Boundary
 
-### Plugin Lifecycle
+### One header, one object, one number
 
-1. **Discovery** — The host scans its plugin directory for shared libraries. For each one, it loads the exported `spc_plugin_vtable` symbol.
-2. **Descriptor** — The host calls `get_descriptor()` to read the plugin's metadata, ports, and parameters. This is called once.
-3. **Instantiation** — The host calls `create_instance()` to allocate a new plugin instance. Multiple instances of the same plugin are allowed.
-4. **Host Services** — If the vtable has a non-null `set_host_services`, the host calls it to inject logging and frame allocation callbacks.
-5. **Parameters** — The host calls `set_parameter()` to push initial values and user changes. It calls `get_parameter()` to read current values.
-6. **Start** — For streaming plugins (sources, cameras), the host calls `start()` before the first `process()`.
-7. **Process** — The engine calls `process()` on each tick. Input data arrives in the `inputs` array; the plugin writes results to the `outputs` array.
-8. **Stop** — The host calls `stop()` when the pipeline stops.
-9. **Destruction** — The host calls `destroy_instance()` to free the plugin state.
+- **One header.** `speculor/plugin.h` declares everything that crosses between the engine and a plugin, in C11, with no other include than `stdint.h`. Everything else in the SDK (the builder, the macros, the table and GPU helpers) is compiled into your plugin and never crosses.
+- **One object.** A plugin library exports `SpcPlugin spc_plugin`: a table of slots, the functions the engine calls.
+- **One number.** The first field of `spc_plugin` is `abi`. The engine reads it before anything else and loads the plugin only when it equals its own `SPC_ABI`. Any change to the header that a plugin could notice changes the number, so build against the SDK bundle that matches the application release you target. `SPC_SDK_VERSION` (`speculor/version.h`) versions the C++ conveniences and the bundle; it does not decide whether a plugin loads.
+- **Strings and arrays by pointer.** Every string is nul-terminated `const char*`; those of the node info are never null (`""` when there is nothing to say). Every array comes with its count. Whoever makes a string or an array owns it, and each stays within the limits the header names.
+- **Stable numbers.** `SpcDataType` values are stored in projects and sessions, and the order of `SpcLicenseTier` is the licence gate. Neither is ever renumbered.
 
-### The VTable
+### The slots
 
-Every plugin exports a single symbol `spc_plugin_vtable` of type `SpcPluginVTable`:
+`SpcPlugin` declares its slots in this order:
 
-```c
-typedef struct {
-    uint32_t                 struct_size;        // = sizeof(SpcPluginVTable)
-    SpcGetDescriptorFn       get_descriptor;
-    SpcCreateInstanceFn      create_instance;
-    SpcDestroyInstanceFn     destroy_instance;
-    SpcSetParameterFn        set_parameter;
-    SpcGetParameterFn        get_parameter;
-    SpcProcessFn             process;
-    SpcStartFn               start;              // NULL if not a source
-    SpcStopFn                stop;               // NULL if not a source
-    SpcSetHostServicesFn     set_host_services;   // NULL if not needed
-    SpcOnSignalFn            on_signal;           // NULL if no signal inputs
-    SpcOnInputEventFn        on_input_event;      // NULL if not interactive
-    SpcScanDevicesFn         scan_devices;        // NULL if no device scanning
-    SpcOnControlResponseFn   on_control_response; // NULL if no control responses
-    SpcGetListRowsFn         get_list_rows;       // NULL if no list params
-    SpcSetListRowsFn         set_list_rows;       // NULL if no list params
-    SpcValidateMandatoryFn   validate_mandatory;  // NULL = host runs default flag-based check
-    SpcRecordGpuFn           record_gpu;          // NULL = CPU-only or legacy non-coalesced
-                                                  // GPU plugin. Non-NULL opts the plugin
-                                                  // into engine-driven coalesced GPU submit
-                                                  // (one vkQueueSubmit2 per subgraph per
-                                                  // frame instead of one per plugin) — the
-                                                  // standard path for all GPU plugins, see
-                                                  // "GPU Compute Plugins" below.
-    SpcRequestStopFn         request_stop;        // NULL = engine relies on stop_token + queue
-                                                  // shutdown alone. Non-NULL = plugin gets an
-                                                  // abort-signal call BEFORE drain. Required
-                                                  // for plugins whose process()/record_gpu
-                                                  // can block on uninterruptible I/O (FFmpeg
-                                                  // av_read_frame on RTSP, blocking socket
-                                                  // recv). See "Two-Phase Shutdown" below.
-} SpcPluginVTable;
-```
+| Slot | Required | What it does |
+|---|---|---|
+| `info` | yes | Returns the node info. Called once, when the library is discovered |
+| `start` | yes | Makes an instance from the host and every parameter value |
+| `stop` | yes | Tears the instance down and frees it |
+| `process` | | Runs one step |
+| `interrupt` | | Phase 1 of shutdown: cut blocking I/O ([Two-Phase Shutdown](#two-phase-shutdown)) |
+| `params_changed` | | Tells a running instance the values again |
+| `record_gpu` | for `SPC_GPU_RECORDED` and `SPC_GPU_OWN_SUBMIT` | Records one step's GPU work ([GPU Plugins](#gpu-plugins)) |
+| `ui_input` | | A mouse or key input on the node's view |
+| `control_reply` | | A reply to a control command the instance sent |
+| `param_rules` | | Which parameters the values leave disabled or missing |
+| `list_options` | | The options of an ENUM parameter that only looking can find |
 
-The `struct_size` field enables forward compatibility. If a future SDK version appends new function pointers to the vtable, the host uses `struct_size` to detect which fields are present. Older plugins compiled against an earlier SDK will have a smaller `struct_size` and the host will treat the missing fields as `NULL`.
+### Exporting
 
-### Capability Flags
+`SPC_EXPORT_PLUGIN(...)` (`plugin.h`) defines `spc_plugin` with `abi` set to `SPC_ABI`, from the slots it lists. It works in C and in C++.
 
-Plugins declare their capabilities in the descriptor. The host uses these to determine which vtable functions to call:
+- List only the slots you implement, in the order of the table above. C++20 designated initializers must follow declaration order.
+- The macro ends the definition itself: write no semicolon after it.
+- An `#ifdef` cannot go inside a macro's arguments. For a slot that only a Vulkan build has, write `SPC_IF_VULKAN(.record_gpu = record_gpu,)` (`plugin_macros.h`): it expands to its argument when `SPC_HAS_VULKAN` is defined, and to nothing otherwise.
+
+C++ plugins can also use the SDK's composition layer, which builds `start` and `stop` from functions of another shape. It exports with `SPC_EXPORT_PLUGIN_SLOTS(...)`; see [The C++ Composition Layer](#the-c-composition-layer).
+
+### A plugin in C
+
+`plugin.h` alone is enough to write a plugin in C, or to bind one from another language. Without the C++ builder, the node info is filled by hand:
 
 ```c
-typedef enum {
-    SPC_CAP_NONE         = 0,
-    SPC_CAP_STREAMING    = 1 << 0,  // plugin has start/stop lifecycle
-    SPC_CAP_SIGNAL_INPUT = 1 << 1,  // plugin has on_signal handler
-    SPC_CAP_FRAME_ALLOC  = 1 << 2,  // plugin uses host frame pool for zero-copy output
-    SPC_CAP_INTERACTIVE  = 1 << 3,  // plugin accepts mouse/keyboard events via on_input_event
-    SPC_CAP_DEVICE_SCAN  = 1 << 4,  // plugin supports scan_devices() for hardware enumeration
-    SPC_CAP_GPU_COMPUTE  = 1 << 5,  // plugin uses GPU compute (accepts/produces GPU-resident frames)
-    SPC_CAP_GPU_OWN_SUBMIT = 1 << 6, // GPU node does its own queue submits (never coalesced)
-} SpcPluginCaps;
+#include <speculor/plugin.h>
+
+#include <stdlib.h>
+
+enum { P_VALUE };
+
+static const SpcParam kParams[] = {
+    {
+        .id = "value", .label = "Value", .group = "", .help = "The value to output",
+        .type = SPC_PARAM_FLOAT,
+        .def = {.f = 0.0f}, .min = {.f = -1e6f}, .max = {.f = 1e6f}, .step = {.f = 0.1f},
+    },
+};
+
+static const SpcPort kOutputs[] = {
+    {.id = "value_out", .label = "Value", .type = SPC_DATA_SCALAR},
+};
+
+static const SpcNodeInfo kInfo = {
+    .id = "c_constant", .label = "C Constant", .category = "Sources/General",
+    .author = "You", .version = "0.1.0", .help = "Outputs a constant scalar",
+    .traits = SPC_NODE_RUN_ON_CHANGE,
+    .outputs = kOutputs, .output_count = 1,
+    .params = kParams, .param_count = 1,
+};
+
+typedef struct { float value; } Constant;
+
+static const SpcNodeInfo* info(void) { return &kInfo; }
+
+static SpcPluginInstance* start(SpcHost* host, const SpcValue* values)
+{
+    (void)host;
+    Constant* c = malloc(sizeof *c);
+    if (!c) return NULL;
+    c->value = values[P_VALUE].f;
+    return (SpcPluginInstance*)c;
+}
+
+static void stop(SpcPluginInstance* instance) { free(instance); }
+
+static int process(SpcPluginInstance* instance, SpcStep* step)
+{
+    SpcData* out = &step->outputs[0];
+    out->type = SPC_DATA_SCALAR;
+    out->scalar = (SpcScalar){.type = SPC_FIELD_FLOAT, .f32 = ((Constant*)instance)->value};
+    return SPC_OK;
+}
+
+static void params_changed(SpcPluginInstance* instance, const SpcValue* values, uint64_t changed)
+{
+    (void)changed;
+    ((Constant*)instance)->value = values[P_VALUE].f;
+}
+
+SPC_EXPORT_PLUGIN(.info = info, .start = start, .stop = stop, .process = process,
+                  .params_changed = params_changed)
 ```
 
-Use `DescriptorBuilder::gpu_compute()` instead of setting `SPC_CAP_GPU_COMPUTE` manually — it also adds the engine-managed `gpu_enabled` parameter. See [GPU Compute Plugins](#gpu-compute-plugins) for details.
-
-Use `DescriptorBuilder::gpu_own_submit()` for a GPU node that submits to **its own queue** — e.g. NVOFA hardware optical flow, which fence-waits on a dedicated hardware queue. The engine routes GPU-resident input and calls `record_gpu`, but never fuses the node into a coalesced subgraph, so it can't stall a fused chain at pipeline depth > 1. `gpu_own_submit()` implies `gpu_compute()`.
+Four structs in the header hold an anonymous union (`SpcValue`, `SpcScalar`, `SpcData`, `SpcUiInput`), so C11 is the minimum. Build the library with `SPC_PLUGIN_EXPORT` defined and every symbol but `spc_plugin` hidden; `spc_add_plugin()` does this for C++ sources.
 
 ---
 
-## The Descriptor
+## Lifecycle
 
-Use `spc::DescriptorBuilder` to construct your plugin's descriptor. The builder provides a fluent API:
+```
+library loaded, abi checked
+  -> info()                          once, at discovery
+  -> start(host, values)             returns an instance
+  -> running: process / record_gpu,
+              params_changed, ui_input, control_reply
+  -> interrupt()                     optional, from another thread
+  -> stop(instance)                  frees it
+  -> start(...) again on the next run
+```
+
+- **An instance exists only while its node runs.** `start()` makes it and `stop()` frees it. Stop and Play, and a restart after a crash or a hang, each make a new one. Whatever a plugin keeps between runs, it keeps in its parameters.
+- **`start(host, values)`** gets the host it will use and every parameter value in declaration order (`values` is null when the plugin declares none). It returns the instance, or null after saying why through `host->log`. When it returns null, nothing else is called, `stop()` included, so it undoes what it made.
+- **`stop(instance)`** comes after the node's thread has left the plugin. Nothing is called on the instance afterwards.
+- **Several instances of one plugin may run at once**, one per node, and an abandoned instance may still be running when its replacement starts (see [Health and the Watchdog](#health-and-the-watchdog)). Keep state in the instance, not in globals.
+
+---
+
+## Threads
+
+### Calls into the plugin
+
+| Call | Thread | Alongside |
+|---|---|---|
+| `info` | the loader, once, at discovery | nothing |
+| `start` | an engine thread, before the node's steps; given up on after 30 s | nothing of this instance |
+| `process`, `record_gpu` | the node's thread | `interrupt` only |
+| `params_changed` | the node's thread, between steps | `interrupt` only |
+| `ui_input` | the node's thread, between steps (the host queues it) | `interrupt` only |
+| `control_reply` | the node's thread, between steps | `interrupt` only |
+| `interrupt` | any engine thread, before the engine waits for the node's thread | a step in progress |
+| `stop` | an engine thread, after the node's thread left the plugin | nothing |
+| `param_rules` | any thread, any time; no instance | anything |
+| `list_options` | off the host's GUI thread; no instance | anything |
+
+The engine calls an instance one call at a time, `interrupt` aside, so the plugin needs no lock for its own state on the engine's account. `start()` and `stop()` run on an engine thread, not the node's: anything a plugin sets up per thread (a thread-local log sink, a COM apartment) belongs at the top of `process()`.
+
+### Host functions
+
+`SpcHost` is the table of functions the engine lends each running node. The plugin gets it in `start()` and may keep it until `stop()` returns. Every function takes the host itself as its first argument, and **every function is set**: one that does not apply to the node answers no (`gpu()` returns null while the node's GPU is off, `gpu_frame()` on a node with no GPU frames to lend), so a plugin calls it without checking it first.
+
+Each function may be called only from where the header says. "Any plugin thread" is any thread the plugin is called on or owns, until `stop()` returns.
+
+| Function | What it does | Where |
+|---|---|---|
+| `log(host, level, message)` | A log line, attributed to the node | any plugin thread |
+| `now_mono_ns(host)` | Monotonic nanoseconds; never steps back | any plugin thread |
+| `now_utc_ns(host)` | Disciplined UTC nanoseconds, the timeline of every timestamp | any plugin thread |
+| `time(host, &info)` | Both timelines, the sync source, its error bound and lock state | any plugin thread |
+| `discipline_clock(host, &correction)` | Steers the engine clock from a reference the plugin reads | any plugin thread |
+| `frame(host, out, w, h, format)` | A frame from the engine's pool for an output; null when none can be had | `process`, `record_gpu` |
+| `release_frame(host, frame)` | Gives back a frame from `frame()` or `gpu_frame()` that is not put on an output | `process`, `record_gpu` |
+| `table(host, out, rows)` | A zeroed table of an output's schema, lent for the step | `process`, `record_gpu` |
+| `set_output_schema(host, out, schema)` | Columns decided at run time for a table or signal output | `start`, `process` |
+| `control(host, out, kind, param, type, value, request_id)` | A command on a control output | `process`, `record_gpu` |
+| `take_signal(host, in)` | The next block waiting on a signal input, or null | one thread at a time per port: the node's, or one the plugin owns |
+| `emit_event(host, &event)` | An event for the session and the GUI | `process`, `record_gpu`, `ui_input` |
+| `emit_event_snapshot(host, &event, frame, x, y, w, h)` | The same, with a thumbnail cropped from a frame | `process`, `record_gpu`, `ui_input` |
+| `set_param(host, param, &value)` | Sets one of the plugin's own parameters | any plugin thread |
+| `set_param_view(host, param, &view)` | How a parameter presents while the instance lives | any plugin thread |
+| `display_size(host, &w, &h)` | The pixel size of the widget showing the node; non-zero when no widget shows it | any plugin thread |
+| `gpu(host)` | The device the host lends; null when the node's GPU is off | any plugin thread |
+| `gpu_frame(host, out, w, h, format)` | A GPU-resident output frame; null when the node's GPU is off or it has no Vulkan device | `process`, `record_gpu` |
+| `ensure_cpu_data(host, frame)` | Gives a GPU-resident frame its CPU pixels; non-zero when it cannot | `process`, `record_gpu` |
+| `gpu_buffer(host, handle, &buffer)` | The buffer behind a frame's `gpu_handle` | `process`, `record_gpu` |
+| `gpu_share_buffer(host, &buffer, cpu_copy)` | Offers a buffer of the plugin's own downstream; returns its handle | `process`, `record_gpu` |
+| `gpu_unshare_buffer(host, handle)` | Withdraws a shared buffer | `process`, `record_gpu`, `stop` |
+| `gpu_read_buffer(host, handle, dest, size)` | Copies the bytes behind a handle to CPU memory; waits for the GPU | `process`, `record_gpu` |
+| `gpu_time(host, microseconds)` | GPU time the engine cannot see, for the node's statistics | any plugin thread |
+
+`node_label` is a field, not a function: the node's name, valid until `stop()` returns.
+
+The conformance harness checks every one of these rules ([Testing Your Plugin](#testing-your-plugin)).
+
+---
+
+## The Node Info
+
+`SpcNodeInfo` says what the plugin is: its identity, its ports and its parameters. It belongs to the plugin and lives, unchanged, while the library is loaded. In C++, `SPC_PLUGIN_DESCRIPTOR(builder)` defines `info()` from a `spc::DescriptorBuilder`:
 
 ```cpp
 SPC_PLUGIN_DESCRIPTOR(
-    spc::DescriptorBuilder("my_plugin", "My Plugin", "Filters")
-        .author("Your Name")
-        .version("1.0.0")
-        .description("Does something useful")
-        // capabilities
-        .streaming()             // sets SPC_CAP_STREAMING
-        .frame_alloc()           // sets SPC_CAP_FRAME_ALLOC
-        .static_source()         // sets SPC_PLUGIN_STATIC flag
-        // ports
-        .input("frame_in", "Image", SPC_DATA_FRAME)
-        .output("frame_out", "Image Out", SPC_DATA_FRAME)
-        // parameters
+    spc::DescriptorBuilder("my_filter", "My Filter", "Filters/Image")
+        .author("You").version("1.0.0")
+        .help("Does something useful")
+        .maturity(SPC_MATURITY_PREVIEW)
+        .tags({"image"})
+        .input("in", "Input", SPC_DATA_FRAME)
+        .output("out", "Output", SPC_DATA_FRAME)
         .float_param("gain", "Gain", 0.0f, 10.0f, 1.0f, 0.1f)
+            .param_help("Multiplier applied to every pixel")
 )
 ```
 
-Pass the builder expression straight into `SPC_PLUGIN_DESCRIPTOR` — the macro fills the descriptor in place via `build_into()`. There is no `build()` method to call at the end of the chain.
+- **`id`** identifies the plugin in saved projects. Never change it.
+- **`.maturity(m)`**: `SPC_MATURITY_EXPERIMENTAL` (the default), `_PREVIEW` or `_STABLE`. The plugin browser filters on it.
+- **`.license_tier(t)`**: the lowest licence tier that may use the plugin, `SPC_LICENSE_COMMUNITY` (the default, everyone) up to `SPC_LICENSE_ENTERPRISE`. The host does not offer a plugin whose tier is above the active licence.
+- **`.tags({...})`**: domain tags, at most `SPC_TAG_MAX`.
 
-Two optional classification methods sit alongside the metadata above:
+### Traits
 
-- **`.maturity(m)`** — `SPC_MATURITY_EXPERIMENTAL` / `_PREVIEW` / `_STABLE`. Drives the plugin browser's maturity filter; defaults to `EXPERIMENTAL` (the zero value).
-- **`.license_tier(t)`** — the **minimum** license tier required to use the plugin: `SPC_LICENSE_COMMUNITY` (default) / `_PERSONAL` / `_INDIE` / `_TEAM` / `_ENTERPRISE`. At load time the host skips any plugin whose required tier is above the active license — it never loads and never appears in the browser. Omit it and the plugin defaults to `COMMUNITY`, available to everyone.
+| Trait | Builder | Meaning |
+|---|---|---|
+| `SPC_NODE_RUN_ON_CHANGE` | `.run_on_change()` | Runs once, then again only when a parameter changes |
+| `SPC_NODE_SOURCE` | `.source()` | Its data comes from outside the pipeline: a device, a file, a network stream, a generator. A recording captures it, and replay feeds it from the session instead of running the node. A source without it is neither recorded nor replayed |
+| `SPC_NODE_LIVE_ONLY` | `.live_only()` | `process()` has an effect outside the pipeline that cannot be undone: network egress, a recorder, a service feed. Replay skips the node, so a session is never sent or recorded twice. Terminal sinks only |
 
-### Descriptor Flags
+### Ports
 
-Separate from the capability flags, a descriptor carries a flag bitmask that tells the engine how the node behaves with respect to the pipeline boundary. Set them via `DescriptorBuilder`:
+Inputs and outputs are numbered separately, each from zero in declaration order, at most `SPC_PORT_MAX` of each.
 
-| Flag | Builder | Meaning |
-|------|---------|---------|
-| `SPC_PLUGIN_STATIC` (1 << 0) | `.static_source()` | Process once, then re-run only when a parameter changes. |
-| `SPC_PLUGIN_DATA_SOURCE` (1 << 1) | `.data_source()` | The plugin ingests data from **outside** the pipeline (camera/SDR/GPS device, file, network stream, generator) rather than deriving output from its inputs. |
-| `SPC_PLUGIN_LIVE_ONLY` (1 << 2) | `.live_only()` | `process()` has an irreversible effect outside the pipeline (recorder, network egress, DB/service feed). **Terminal sinks only.** |
+| Builder | Port |
+|---|---|
+| `.input(id, label, type)` / `.output(id, label, type)` | A port of type `SPC_DATA_FRAME`, `SPC_DATA_SCALAR`, `SPC_DATA_JSON` or `SPC_DATA_PACKET` |
+| `.input(id, label, type, capacity, mode)` | An input with a queue capacity and a consume mode |
+| `.input_table(id, label, {fields} [, capacity, mode])` / `.output_table(id, label, {fields})` | A table port and its fields |
+| `.input_signal(id, label, {fields})` / `.output_signal(id, label, {fields})` | A signal port and its fields |
+| `.optional_fields({fields})` | More fields for the input just added, each read only when the producer sends it |
+| `.output_control(id, label)` | A control output (`SPC_DATA_CONTROL`) |
+| `.gpu_ok()` | The input just added takes GPU-resident frames as they are (`SPC_INPUT_GPU_OK`): the engine does not download them first |
 
-The last two are the **replay egress-safety flags** (SDK ≥ 0.20.0), and getting them right matters for recording/replay correctness:
+Fields are `{id, type}` pairs: `{"x", SPC_FIELD_FLOAT}`. A table field is a fixed-size type: `SPC_FIELD_FLOAT`, `_FLOAT64`, `_INT8` to `_INT64`, `_UINT8` to `_UINT64`, `_BOOL`, `_DECIMAL`, or `_STRING32` / `_64` / `_128` / `_256`.
 
-- `.data_source()` marks what a Sources-mode session recording captures, and what reinjection replay drives. A source that omits the flag is not recorded and not replayed.
-- `.live_only()` makes the engine skip the node during reinjection replay, so replaying a recorded session never re-broadcasts or re-uploads its data. A live sink that omits the flag will re-emit externally on every replay.
-
-### Port Types
-
-| Method | Data Type | Use Case |
-|--------|-----------|----------|
-| `.input(name, display, SPC_DATA_FRAME)` | Frame | Video/image data |
-| `.output(name, display, SPC_DATA_FRAME)` | Frame | Video/image data |
-| `.input(name, display, SPC_DATA_SCALAR)` | Scalar | Single float values (FPS, temperature) |
-| `.output(name, display, SPC_DATA_SCALAR)` | Scalar | Single float values |
-| `.input_table(name, display, fields)` | Table | Binary flat array (hot path) |
-| `.output_table(name, display, fields)` | Table | Binary flat array |
-| `.input_signal(name, display, fields)` | Signal | Direct-call zero-copy data (high throughput) |
-| `.output_signal(name, display, fields)` | Signal | Direct-call zero-copy data |
-| `.input(name, display, SPC_DATA_RECORD)` | Record | JSON metadata (cold path) |
-| `.output(name, display, SPC_DATA_RECORD)` | Record | JSON metadata |
-| `.output_control(name, display)` | Control Msg | Inter-plugin parameter control (`SPC_DATA_CONTROL_MSG`). `.output_param_cmd(name, display)` is a synonym kept for older plugin sources. |
-
-For table, signal, and record ports, pass the schema as a field list:
-
-```cpp
-.output_table("detections", "Detections", {
-    {"x", SPC_FIELD_FLOAT}, {"y", SPC_FIELD_FLOAT},
-    {"w", SPC_FIELD_FLOAT}, {"h", SPC_FIELD_FLOAT},
-    {"confidence", SPC_FIELD_FLOAT},
-})
-```
-
-Input ports can specify a queue capacity and consume mode:
-
-```cpp
-.input_table("boxes_in", "Boxes", {
-    {"x", SPC_FIELD_FLOAT}, {"y", SPC_FIELD_FLOAT},
-    {"w", SPC_FIELD_FLOAT}, {"h", SPC_FIELD_FLOAT},
-}, 4, SPC_CONSUME_LATEST)
-```
+An input declares every field it reads. A connection whose producer lacks a required field is refused; an optional field the producer lacks reads as missing.
 
 Consume modes:
-- `SPC_CONSUME_DEFAULT` — engine decides
-- `SPC_CONSUME_FIFO` — pop every frame in order (blocking)
-- `SPC_CONSUME_LATEST` — skip to newest, drop intermediates (blocking)
-- `SPC_CONSUME_NON_BLOCKING` — try_pop, for static/optional inputs. Nodes with **only** NON_BLOCKING inputs are classified as source nodes and run on their own wall-clock timing instead of being input-driven.
 
-Queue capacity applies to FIFO and NON_BLOCKING ports. `SPC_CONSUME_LATEST`
-ports run a 1-slot queue regardless of the declared capacity: the consumer
-only ever takes the newest item, and a deeper queue would just pin pool
-frames while the node is blocked on another port.
+- `SPC_CONSUME_FIFO`: every datum, in order. The node waits for it.
+- `SPC_CONSUME_LATEST`: the newest datum, dropping older ones. The node waits for it. The queue holds one datum whatever the capacity.
+- `SPC_CONSUME_NON_BLOCKING`: whatever has arrived, without waiting; the input is `SPC_DATA_NONE` when nothing has. Use it for side inputs that update state without driving the node (a GPS position, a mask). A node whose inputs are all non-blocking runs at its own pace, like a source.
+- `SPC_CONSUME_DEFAULT`: the engine decides.
 
-`SPC_CONSUME_NON_BLOCKING` is the canonical pattern for **side-channel inputs** that update plugin state without gating `process()` — for example a `gps_in` port on a decoder that latches the receiver's position into its output, or on a camera source that stamps the camera's location into the emitted metadata record. The plugin polls the port each tick — when no fresh sample is available, the cached last-known-good value remains in effect.
+### Parameters
 
-### Parameter Methods
+| Builder | Type | The value, in `SpcValue` |
+|---|---|---|
+| `.int_param(id, label, min, max, default, step [, group])` | `SPC_PARAM_INT` | `.i` |
+| `.float_param(...)` | `SPC_PARAM_FLOAT` | `.f` |
+| `.float64_param(...)` | `SPC_PARAM_FLOAT64` | `.d` |
+| `.bool_param(id, label, default [, group])` | `SPC_PARAM_BOOL` | `.i`, 0 or 1 |
+| `.string_param(id, label, default [, group])` | `SPC_PARAM_STRING`, up to `SPC_PARAM_STRING_MAX` | `.str.ptr`, `.str.len` |
+| `.text_param(id, label, default [, group])` | `SPC_PARAM_TEXT`, multi-line, up to `SPC_PARAM_TEXT_MAX` | `.str.ptr`, `.str.len` |
+| `.enum_param(id, label, {labels}, default_index [, group])` | `SPC_PARAM_ENUM` | `.choice.index`, `.choice.id` |
+| `.color_param(id, label, rgba [, group])` | `SPC_PARAM_COLOR` | `.color`, `0xRRGGBBAA` |
+| `.decimal_param(id, label, min, max, default, step [, group])` | `SPC_PARAM_DECIMAL` | `.decimal` |
+| `.trigger_param(id, label [, group])` | `SPC_PARAM_TRIGGER`, a push button | `.i`, 1 in the call it fired in |
+| `.list_param(id, label [, group])`, then `.list_column(...)` / `.list_column_enum(...)` | `SPC_PARAM_LIST`, rows the user edits | `.list.cells`, `.list.rows`, `.list.cols` |
 
-| Method | State Field Type | Arguments |
-|--------|-----------------|-----------|
-| `.int_param(name, display, min, max, default, step, group)` | `int32_t` | `group` is optional |
-| `.float_param(name, display, min, max, default, step, group)` | `float` | `group` is optional |
-| `.bool_param(name, display, default, group)` | `int32_t` (0 or 1) | `group` is optional |
-| `.string_param(name, display, default, group)` | `char[SPC_PARAM_STRING_MAX]` | `group` is optional |
-| `.enum_param(name, display, {"A", "B", "C"}, default_index, group)` | `int32_t` (index) | `group` is optional |
-| `.color_param(name, display, default_rgba, group)` | `uint32_t` (0xRRGGBBAA) | `group` is optional |
-| `.float64_param(name, display, min, max, default, step, group)` | `double` | `group` is optional |
-| `.decimal_param(name, display, min, max, default, step, group)` | `SpcDecimal` (16 bytes) | All args are `SpcDecimal`; `group` is optional |
-| `.trigger_param(name, display, group)` | — (momentary) | `group` is optional |
-| `.text_param(name, display, default, group)` | `char[SPC_PARAM_TEXT_MAX]` | Multi-line text (SQL, scripts); `group` is optional |
-| `.list_param(name, display, group)` | structured list | Chain `.list_column()` calls after |
-| `.param_description(text)` | — | Sets tooltip on the previously added parameter |
+After a parameter:
 
-The `group` parameter is an optional string that groups parameters together in the UI. Omit it to use the default group.
+- `.param_help(text)` sets its tooltip.
+- `.mandatory()`: the pipeline does not start until it holds a non-empty value.
+- `.listed()` on an ENUM: its options come from `list_options` ([Listing options](#listing-options)).
+- `.flag(bits)` adds other flags: `SPC_PARAM_FLAG_STOP_ONLY` (it cannot change while the pipeline runs), `SPC_PARAM_FLAG_STREAM_BINDING` (on a source's STRING: its value names the stream the node carries, which recordings and replay match by).
 
-Chain `.param_description()` after any parameter method to add a tooltip shown on hover in the UI:
-```cpp
-.int_param("threshold", "Threshold", 1, 255, 50, 1, "Detection")
-    .param_description("Pixel intensity difference to classify as foreground")
-```
+Projects save values by parameter id, so never change a shipped parameter's id, default or range. A plugin that uses a GPU does not declare `gpu_enabled` or `gpu_profile`: the engine adds and owns them ([GPU Plugins](#gpu-plugins)).
 
 ---
 
-## Plugin State & Macros
+## Parameters at Run Time
 
-The SDK provides a hierarchy of macros for generating boilerplate. Choose the level of control you need.
-
-### `SPC_PLUGIN(State, host)` — The One-Liner
-
-For most plugins, this is all you need. It generates four functions:
+The engine holds every value. It checks a new value against the declaration, saves it with the project and shows it. The plugin is told the values and is never asked for them.
 
 ```cpp
-struct MyState {
-    spc::HostServices host;    // required: name must match the macro argument
-    int32_t threshold = 50;
+enum Param : uint32_t { P_MODE, P_THRESHOLD, P_LABEL };   // declaration order
+
+struct Params {
+    int32_t mode;
+    float threshold;
+    std::string label;
 };
 
-SPC_PLUGIN(MyState, host)
-// generates:
-//   static MyState* state(SpcPluginInstance*)           — cast helper
-//   static SpcPluginInstance* create_instance()         — new MyState{}
-//   static void destroy_instance(SpcPluginInstance*)    — delete state(inst)
-//   static void set_host_services(SpcPluginInstance*,   — injects services
-//                                  const SpcHostServices*)
-```
-
-Your state struct must be default-constructible. Use member initializers for default values.
-
-### `SPC_PLUGIN_CAST(State)` + `SPC_PLUGIN_HOST_SERVICES(State, host)` — Custom Create/Destroy
-
-When you need to do work in create or destroy (allocate tables, open files, precompute offsets), use the split macros:
-
-```cpp
-SPC_PLUGIN_CAST(MyState)
-SPC_PLUGIN_HOST_SERVICES(MyState, host)
-
-static SpcPluginInstance* create_instance() {
-    auto* s = new MyState{};
-    // custom initialization here
-    spc_table_init(&s->output_table, s->stride, &get_descriptor()->ports[0].schema);
-    return reinterpret_cast<SpcPluginInstance*>(s);
+static Params read_params(const SpcValue* values)
+{
+    Params p;
+    p.mode      = values[P_MODE].choice.index;   // ENUM: the position of the option
+    p.threshold = values[P_THRESHOLD].f;
+    p.label.assign(values[P_LABEL].str.ptr, values[P_LABEL].str.len);   // copy: valid during the call only
+    return p;
 }
 
-static void destroy_instance(SpcPluginInstance* inst) {
-    auto* s = state(inst);
-    spc_table_free(&s->output_table);
-    delete s;
+static void params_changed(SpcPluginInstance* instance, const SpcValue* values,
+                           uint64_t changed)
+{
+    auto* s = state(instance);
+    s->params = read_params(values);
+    if (changed & (uint64_t{1} << P_MODE)) s->rebuild = true;
 }
 ```
 
-`SPC_PLUGIN_CAST` generates only the `state()` cast helper. `SPC_PLUGIN_HOST_SERVICES` generates only `set_host_services()`. You write `create_instance()` and `destroy_instance()` yourself.
+- **`start()` and `params_changed()` get the same array**: one value per declared parameter, in declaration order. Bit `i` of `changed` is set for each value that differs from what the instance last had. A TRIGGER's bit is set in the one call it fired in.
+- **`params_changed` runs on the node's thread, between steps**, so the plugin reads its values without a lock. A plugin that only reads its parameters in `start()` leaves the slot out; a change then takes effect on the next run.
+- **Values live during the call.** Copy a STRING, TEXT or LIST you keep.
+- **An ENUM restored by id** that is not among the options has the position one past the last option.
+- **A LIST** holds `rows * cols` values, row after row, each cell in the member its column's type names.
 
-### `SPC_PLUGIN_STATE(State)` — No Host Services
+### Changing a value from the plugin
 
-For plugins that do not need logging or frame allocation:
+A value the plugin settled on itself (an auto-exposure result, a selection made on its own panel, a device's real rate), it sets with `set_param`. The host stores, saves and shows it, and does not report it back through `params_changed`. How a parameter presents while the instance lives, it sets with `set_param_view`:
 
 ```cpp
-SPC_PLUGIN_STATE(MyState)
-// generates: state(), create_instance(), destroy_instance()
-// does NOT generate set_host_services()
+SpcValue rate{};
+rate.i = device_rate;
+host->set_param(host, P_SAMPLE_RATE, &rate);
+
+SpcParamView view{};
+view.fields = SPC_PARAM_VIEW_RANGE;   // _STATE, _RANGE and _OPTIONS name what is set
+view.min = 1.0;
+view.max = device_max_gain;
+view.step = 1.0;
+host->set_param_view(host, P_GAIN, &view);
 ```
 
-`SPC_PLUGIN_VTABLE` only wires the slots you list. If your plugin does not need host services, omit the `.set_host_services` entry — the engine treats a null slot as "this plugin does not consume host services."
+### Parameter rules
 
----
-
-## Parameters
-
-There are three approaches to handling parameters, from simplest to most flexible.
-
-### Approach 1: `SPC_PLUGIN_AUTO_PARAMS` — Pure Dispatch
-
-Use this when parameter changes have no side effects. The macro generates both `set_parameter()` and `get_parameter()` that directly read/write struct fields:
+`param_rules(values, states)` says which parameters the values leave disabled or missing. It is a function of the values alone: no instance, any thread. `states` has one entry per parameter; each arrives 0, or `SPC_PARAM_STATE_MISSING` for an empty mandatory STRING or TEXT, and the plugin sets or clears bits:
 
 ```cpp
-struct MyState {
-    spc::HostServices host;
-    float brightness = 0.0f;
-    int32_t threshold = 50;
-    int32_t enabled = 1;           // bool params are int32_t (0 or 1)
-    int32_t mode = 0;              // enum params are int32_t (index)
-    char label[SPC_PARAM_STRING_MAX] = "default";
-    uint32_t tint_color = 0xFF0000FF;  // color params are uint32_t (0xRRGGBBAA)
-};
-
-SPC_PLUGIN(MyState, host)
-
-SPC_PLUGIN_AUTO_PARAMS(MyState,
-    SPC_BIND_FLOAT(MyState, "brightness", brightness),
-    SPC_BIND_INT(MyState, "threshold", threshold),
-    SPC_BIND_BOOL(MyState, "enabled", enabled),
-    SPC_BIND_ENUM(MyState, "mode", mode),
-    SPC_BIND_STRING(MyState, "label", label),
-    SPC_BIND_COLOR(MyState, "tint", tint_color)
-)
-```
-
-Each `SPC_BIND_*` macro creates a `spc::ParamBinding` that maps a parameter name to a field offset. The generated functions use `offsetof` to read/write the correct field. `SPC_BIND_STRING` also captures the field's capacity via `sizeof`, so the bound `char` array can be any size — writes are truncated and null-terminated to fit. Hand-written `ParamBinding` entries (without the macro) leave the capacity at 0, which assumes the field is `char[SPC_PARAM_STRING_MAX]`.
-
-### Approach 2: `try_set_*` / `try_get_*` — Side Effects on Change
-
-When a parameter change needs to trigger work (reallocate a buffer, reopen a device, update dependent state), write `set_parameter` and `get_parameter` manually using the `try_set_*` / `try_get_*` helpers:
-
-```cpp
-static int set_parameter(SpcPluginInstance* inst, const char* name,
-                          const SpcParameterDesc* value) {
-    auto* s = state(inst);
-
-    // target_fps has no side effects — just assign
-    if (spc::try_set_float(name, value, "target_fps", s->target_fps)) return 0;
-
-    // width/height trigger buffer reallocation
-    int32_t w = static_cast<int32_t>(s->width);
-    int32_t h = static_cast<int32_t>(s->height);
-    bool resized = spc::try_set_int(name, value, "width", w)
-                || spc::try_set_int(name, value, "height", h);
-    if (!resized) return -1;
-
-    s->width = static_cast<uint32_t>(w);
-    s->height = static_cast<uint32_t>(h);
-    s->buffer.resize(s->width * s->height * 3);   // side effect
-    return 0;
-}
-
-static int get_parameter(SpcPluginInstance* inst, const char* name,
-                          SpcParameterDesc* out) {
-    auto* s = state(inst);
-    if (spc::try_get_int(name, out, "width", static_cast<int32_t>(s->width))) return 0;
-    if (spc::try_get_int(name, out, "height", static_cast<int32_t>(s->height))) return 0;
-    if (spc::try_get_float(name, out, "target_fps", s->target_fps)) return 0;
-    return -1;
-}
-```
-
-The helper function signatures:
-
-| Setter | Signature |
-|--------|-----------|
-| `try_set_int` | `bool try_set_int(const char* name, const SpcParameterDesc* value, const char* param_name, int32_t& field)` |
-| `try_set_float` | `bool try_set_float(const char* name, const SpcParameterDesc* value, const char* param_name, float& field)` |
-| `try_set_bool` | `bool try_set_bool(const char* name, const SpcParameterDesc* value, const char* param_name, int32_t& field)` |
-| `try_set_enum` | `bool try_set_enum(const char* name, const SpcParameterDesc* value, const char* param_name, int32_t& field)` |
-| `try_set_string` | `bool try_set_string(const char* name, const SpcParameterDesc* value, const char* param_name, char* field)` |
-| `try_set_color` | `bool try_set_color(const char* name, const SpcParameterDesc* value, const char* param_name, uint32_t& field)` |
-
-| Getter | Signature |
-|--------|-----------|
-| `try_get_int` | `bool try_get_int(const char* name, SpcParameterDesc* out, const char* param_name, int32_t value)` |
-| `try_get_float` | `bool try_get_float(const char* name, SpcParameterDesc* out, const char* param_name, float value)` |
-| `try_get_bool` | `bool try_get_bool(const char* name, SpcParameterDesc* out, const char* param_name, int32_t value)` |
-| `try_get_enum` | `bool try_get_enum(const char* name, SpcParameterDesc* out, const char* param_name, int32_t value)` |
-| `try_get_string` | `bool try_get_string(const char* name, SpcParameterDesc* out, const char* param_name, const char* value)` |
-| `try_get_color` | `bool try_get_color(const char* name, SpcParameterDesc* out, const char* param_name, uint32_t value)` |
-
-Each setter returns `true` if the name matched and the field was assigned. Each getter returns `true` if the name matched and the output was written.
-
-### Approach 3: Manual `strcmp` — Maximum Control
-
-For C-only plugins or when you want complete control:
-
-```cpp
-static int set_parameter(SpcPluginInstance* inst, const char* name,
-                          const SpcParameterDesc* value) {
-    MyState* s = (MyState*)inst;
-    if (strcmp(name, "threshold") == 0 && value->type == SPC_PARAM_INT) {
-        s->threshold = value->int_val.value;
-        return 0;
+static void param_rules(const SpcValue* values, uint32_t* states)
+{
+    if (values[P_ENABLE_WEIGHT].i == 0) {
+        states[P_WEIGHT1] |= SPC_PARAM_STATE_DISABLED;
+        states[P_WEIGHT2] |= SPC_PARAM_STATE_DISABLED;
     }
-    return -1;
+    if (values[P_SOURCE].choice.index == 1 && values[P_URL].str.len == 0)
+        states[P_URL] |= SPC_PARAM_STATE_MISSING;   // the pipeline cannot start
 }
 ```
+
+### Listing options
+
+An ENUM whose options are found only by looking (devices, serial ports, files) is flagged `.listed()`, and the plugin implements `list_options`. It has no instance and runs off the GUI thread:
+
+```cpp
+static int list_options(uint32_t param, const SpcValue* /*values*/, int refresh,
+                        SpcHost* host, SpcOptionSinkFn sink, void* sink_ctx)
+{
+    if (param != P_DEVICE) return SPC_NOT_FOUND;
+    if (refresh || !g_scanned) scan_devices(host);   // may take seconds
+    for (const Device& d : g_devices)
+        sink(sink_ctx, d.serial, d.name);            // id saved with the project, label shown
+    return SPC_OK;
+}
+```
+
+- With `refresh` 0, answer from the last scan, and scan only if there has never been one. With `refresh` set, the user asked: look again.
+- `host` may be null. When it is not, no node runs, so only its `log` is for this call.
+- `SPC_OK` with no call to `sink` means there is no option now. Any other result means the plugin could not look, and the options the host holds stand.
+- The declared options are a placeholder until the plugin has listed. A saved choice is restored by its id.
+
+---
+
+## A Step
+
+`process(instance, step)` runs one step. `SpcStep` holds one `SpcData` per input port and one per output port, in port order:
+
+```c
+typedef struct {
+    const SpcData* inputs;
+    uint32_t       input_count;
+    SpcData*       outputs;
+    uint32_t       output_count;
+} SpcStep;
+```
+
+- **Inputs** are the host's, borrowed for the call. An input with nothing this step is `SPC_DATA_NONE`; check `type` before use. A signal input's slot is always `SPC_DATA_NONE`: its blocks are taken from the host ([Signals](#signals)).
+- **Outputs** arrive as `SPC_DATA_NONE`. The plugin sets the type and the datum of each output it produces; an output left `SPC_DATA_NONE` emits nothing. `consumers` on an output is `SPC_PORT_CONSUMERS_NONE` when nothing reads the port this step, so a plugin can skip costly work such as a debug view.
+- **Every datum carries a timestamp and a sequence.** `timestamp_ns` is disciplined UTC on the engine's one clock ([The Clock](#the-clock)). `sequence` is the sequence of what the datum was made from, so data of different kinds can be matched. A filter copies both from its input. A datum left with 0 in either is stamped by the engine as it publishes it: the clock's time, and the sequence of the input the node is processing.
+
+| Result | Value | Meaning |
+|---|---|---|
+| `SPC_OK` | 0 | Done |
+| `SPC_SKIP` | -6 | Nothing this time, not an error. No backoff; the engine calls again after a short poll |
+| `SPC_FAILED` | -1 | Failed. The engine backs off, from 50 ms up to 5 s; a parameter change retries at once |
+| `SPC_DEVICE_LOST` | -5 | The GPU is gone. No backoff: the watchdog takes over |
+| `SPC_INVALID` | -4 | Invalid argument or state |
+| `SPC_NOT_FOUND` | -3 | No such parameter or resource |
+| `SPC_TRUNCATED` | -7 | A value was written cut to fit its field |
+
+From `process()`, every non-zero result other than `SPC_SKIP` and `SPC_DEVICE_LOST` takes the error path, with backoff. `record_gpu` gets the same step, plus the engine's `SpcGpuPass` ([GPU Plugins](#gpu-plugins)).
 
 ---
 
 ## Data Types
 
-The `SpcData` union carries data between nodes:
+| Type | Enum | An output | An input |
+|---|---|---|---|
+| Frame | `SPC_DATA_FRAME` | from `host->frame()`, published without a copy; a frame of the plugin's own is copied | `SpcFrame`, CPU pixels and/or a GPU handle |
+| Table | `SPC_DATA_TABLE` | only from `host->table()`, published without a copy | with `field_offsets` for the fields the input declares |
+| Signal | `SPC_DATA_SIGNAL` | a table from `host->table()`; the host copies each block for every reader | taken with `host->take_signal()` |
+| JSON | `SPC_DATA_JSON` | the plugin's own string, copied | `SpcJson` |
+| Packet | `SPC_DATA_PACKET` | the plugin's own payload, copied | `SpcPacket` |
+| Scalar | `SPC_DATA_SCALAR` | by value | by value |
+| Control | `SPC_DATA_CONTROL` | commands through `host->control()`; replies come to `control_reply` | the host applies them: the plugin sees parameter changes |
+
+The engine refuses an output over its limit rather than copy it: a table over `SPC_TABLE_MAX_BYTES` (256 MiB), a JSON string over `SPC_JSON_MAX_BYTES` (16 MiB), a packet over `SPC_PACKET_MAX_BYTES` (64 MiB). A refused output counts as a delivery failure and is logged once per port.
+
+### Frames
 
 ```c
 typedef struct {
-    SpcDataType type;
-    union {
-        SpcFrame*      frame;        // video/image data
-        SpcTable*      table;        // binary flat array (hot path)
-        SpcRecord*     record;       // JSON metadata (cold path)
-        SpcControlMsg* control_msg;  // inter-plugin parameter control
-        SpcPacket*     packet;       // compressed bitstream (pre-decode)
-        SpcScalar      scalar;       // single typed value
-    };
-} SpcData;
+    uint8_t*        data;          // pixels; null when the frame is GPU-only
+    uint32_t        width, height;
+    uint32_t        stride;        // bytes per row, padding included
+    SpcPixelFormat  format;        // GRAY8, RGB24, BGR24, RGBA32, NV12, FLOAT32, GRAY16, RGB48
+    SpcBayerPattern bayer_pattern;
+    int64_t         timestamp_ns;
+    uint64_t        sequence;
+    uint32_t        pool_id;       // non-zero on a frame from host->frame()
+    uint64_t        gpu_handle;    // 0 = CPU only
+    uint32_t        gpu_flags;     // SPC_GPU_FLAG_RESIDENT, SPC_GPU_FLAG_CPU_VALID
+} SpcFrame;
 ```
 
-| Type | Enum | When to Use |
-|------|------|-------------|
-| Frame | `SPC_DATA_FRAME` | Video frames, images, depth maps |
-| Scalar | `SPC_DATA_SCALAR` | Single float values (FPS, temperature, counters) |
-| Table | `SPC_DATA_TABLE` | Structured binary data on the hot path (detections, tracks) |
-| Record | `SPC_DATA_RECORD` | JSON metadata on the cold path (configuration, events) |
-| Signal | `SPC_DATA_SIGNAL` | High-throughput zero-copy data (audio samples, SDR IQ) |
-| Control Msg | `SPC_DATA_CONTROL_MSG` | Bidirectional control message — set / get / list params on a downstream node |
-| Packet | `SPC_DATA_PACKET` | Compressed bitstream captured pre-decode (encode-free video recording/forwarding). Annex-B H.264/HEVC or MJPEG; `KEYFRAME`/`CONFIG`/`DISCONTINUITY` flags (`AUDIO` + `sample_rate`/`channels` reserved for compressed-audio passthrough); on a queue gap consumers discard until the next keyframe. Packet inputs always consume FIFO |
-
----
-
-## Timestamps and the shared clock
-
-Every `SpcFrame` and `SpcTable` carries `int64_t timestamp_ns` — **disciplined UTC nanoseconds** from the engine's one shared clock. Because all plugins read the same clock, timestamps are directly comparable across sources, which is what makes multi-sensor fusion, triangulation, and federation between Speculor instances correct.
-
-Stamp your output from the shared clock via `spc_clock.h`:
+A filter writes its output into a frame from the engine's pool, which is published without a copy. When no pool frame can be had, a frame of the plugin's own still works, at the cost of a copy:
 
 ```cpp
-#include <spc_clock.h>
-
-out->timestamp_ns = spc::clock::now_utc_ns(s->host);   // disciplined UTC ns
-```
-
-- `spc::clock::now_utc_ns(s->host)` — disciplined UTC ns; use this for the data-plane `timestamp_ns`.
-- `spc::clock::now_mono_ns(s->host)` — monotonic ns (never steps back); use for intervals/pacing, **not** for the timestamp field. Keep `std::chrono::steady_clock` for sleeps/FPS — only the emitted timestamp comes from the shared clock.
-- **Filters** should propagate the input's timestamp (`out->timestamp_ns = in->timestamp_ns;`) rather than re-stamp.
-- A GPS+PPS or NTP source can discipline the shared clock for everyone via `spc::clock::discipline(s->host, &correction)`.
-
-Every call degrades gracefully on an older host (falls back to the system clock), so a plugin built against this SDK still runs — unsynchronized — on a pre-0.14 host.
-
----
-
-## Working with Frames
-
-### Pixel Formats
-
-```c
-typedef enum {
-    SPC_PIXEL_FORMAT_UNKNOWN = 0,
-    SPC_PIXEL_FORMAT_GRAY8,        // 1 channel, 8-bit
-    SPC_PIXEL_FORMAT_RGB24,        // 3 channels, 8-bit each
-    SPC_PIXEL_FORMAT_BGR24,        // 3 channels, 8-bit (legacy, prefer RGB24)
-    SPC_PIXEL_FORMAT_RGBA32,       // 4 channels, 8-bit each
-    SPC_PIXEL_FORMAT_NV12,         // YUV 4:2:0 semi-planar
-    SPC_PIXEL_FORMAT_FLOAT32,      // 1 channel, 32-bit float (depth maps, masks)
-    SPC_PIXEL_FORMAT_GRAY16,       // 1 channel, 16-bit unsigned
-    SPC_PIXEL_FORMAT_RGB48,        // 3 channels, 16-bit each
-} SpcPixelFormat;
-```
-
-### Reading Input Frames
-
-Use the `spc::input_frame()` helper to safely extract a frame from the inputs array:
-
-```cpp
-static int process(SpcPluginInstance* inst, const SpcData* inputs,
-                   uint32_t input_count, SpcData* outputs,
-                   uint32_t output_count) {
-    const auto* frame = spc::input_frame(inputs, input_count, 0);
-    if (!frame) return -1;
-
-    // access pixel data
-    // frame->data     — pointer to pixel buffer
-    // frame->width    — width in pixels
-    // frame->height   — height in pixels
-    // frame->stride   — bytes per row (may include padding)
-    // frame->format   — pixel format enum
-    // ...
-}
-```
-
-### Zero-Copy Output with the Frame Pool
-
-Plugins that declare `.frame_alloc()` in their descriptor can acquire frames directly from the engine's pool, avoiding a copy on the output path:
-
-```cpp
-// try to acquire a pool frame
-SpcFrame* out = s->host.acquire_frame(0, width, height, SPC_PIXEL_FORMAT_RGB24);
-
-if (out) {
-    // write directly into pool buffer
-    render_into(out->data, out->stride, out->width, out->height);
-    out->frame_number = s->frame_count++;
-    spc::set_frame_output(outputs[0], out);
-} else {
-    // fallback: use a local buffer
-    // the engine will copy the data when it sees pool_id == 0
-    render_into(s->buffer.data(), width * 3, width, height);
-    s->local_frame.data = s->buffer.data();
-    s->local_frame.width = width;
-    s->local_frame.height = height;
-    s->local_frame.stride = width * 3;
-    s->local_frame.format = SPC_PIXEL_FORMAT_RGB24;
-    s->local_frame.frame_number = s->frame_count++;
-    spc::set_frame_output(outputs[0], &s->local_frame);
-}
-```
-
-Always handle the fallback case — `acquire_frame` may return `nullptr` if the pool is exhausted. If you acquire a frame but decide not to use it as output, release it with `s->host.release_frame(frame)`. A frame you put on an output belongs to the engine from then on, whatever `process()` returns: if it then fails, the engine puts the frame back in the pool, so don't keep using it.
-
-### GPU Compute Plugins
-
-Frames can stay on GPU between GPU-capable plugins, eliminating PCIe round-trips. The engine handles transfers automatically:
-
-- **GPU→GPU**: device-to-device copy (no PCIe transfer)
-- **GPU→CPU**: instant memcpy from pre-populated staging buffer (no extra GPU submission)
-- **CPU→GPU**: engine auto-uploads once for fan-out to multiple GPU consumers
-
-#### Coalesced GPU submit (the standard path)
-
-When the engine identifies a chain of GPU-active nodes on the same `gpu_profile` that all expose the `record_gpu` vtable slot, it runs them as a **coalesced subgraph**:
-
-- One primary `VkCommandBuffer` per subgraph per frame, owned by the engine.
-- One secondary `VkCommandBuffer` per plugin, allocated by the engine.
-- Each plugin records its dispatches into its own secondary via `record_gpu`.
-- The engine concatenates the secondaries, inserts cross-plugin barriers from the graph's edge metadata, and calls `vkQueueSubmit2` once per subgraph per frame.
-
-This replaces N driver round-trips per frame (one per plugin) with 1, and eliminates a class of NVIDIA driver-pressure crashes on Windows when multiple compute submitters fire concurrently.
-
-`record_gpu` is the standard GPU plugin path — background subtractors, optical flow, warps/dewarpers, and GPU-accelerated video sources all use it. Legacy in-plugin `submit_and_wait` / `submit_and_spin` is reserved for one-shot init paths (model warmup, prepare-on-first-frame).
-
-**Optional fp16 compute storage.** `VulkanContext` exposes `has_float16`, set only when the device supports both `storageBuffer16BitAccess` and `shaderFloat16`. A compute plugin can store its work buffers as `float16_t` to halve bandwidth, gating on `has_float16` with an fp32/CPU fallback when it's absent — device creation never fails on hardware that lacks the extensions.
-
-#### GPU pipeline depth (frames in flight)
-
-The engine runs each coalesced subgraph **K frames deep** (the *GPU pipeline depth*, default 2, range 1–3; Preferences → Performance, or `--pipeline-depth=N` on the CLI), overlapping the CPU recording/upload of frame N+1 with the GPU compute of frame N. Per-frame data-path buffers come from an engine-owned, K-slot edge-buffer ring; the plugin acquires the current slot inside `record_gpu` (see [Producing GPU-Resident Output](#producing-gpu-resident-output)). At K=1 the ring is a single buffer, byte-identical to the pre-pipelined path.
-
-A node declared `gpu_own_submit()` (`SPC_CAP_GPU_OWN_SUBMIT`) is never coalesced — it submits to its own queue and fence-waits there — but it still acquires its GPU-resident outputs from the engine ring so downstream GPU consumers read them without a re-upload.
-
-#### Setting Up a GPU Plugin
-
-Use `gpu_compute()` in the descriptor — it adds `SPC_CAP_GPU_COMPUTE` and an engine-managed `gpu_enabled` parameter (stop-only toggle, grayed out while running):
-
-```cpp
-SPC_PLUGIN_DESCRIPTOR(
-    spc::DescriptorBuilder("my_filter", "My GPU Filter", "Filters")
-        .gpu_compute()      // adds GPU capability + gpu_enabled param
-        .frame_alloc()      // zero-copy output
-        .input("in", "Input", SPC_DATA_FRAME)
-        .output("out", "Output", SPC_DATA_FRAME)
-)
-```
-
-#### GPU Pipeline Class
-
-GPU compute pipelines inherit from `GpuPipelineBase` which provides per-pipeline command buffers, timeline semaphores, and helper methods that eliminate most Vulkan boilerplate. The class exposes both modes:
-
-- **External-cmd-buffer mode** (`begin_external_recording` / `end_external_recording`, or the `ScopedExternalRecording` RAII wrapper) — the coalesced path. The engine begins a secondary, you record into it via the same barrier / dispatch / staging helpers, the engine ends and submits.
-- **Owned-cmd-buffer mode** (`init_base` / `begin_recording` / `submit_and_wait` / `submit_and_spin`) — the legacy non-coalesced path. Used for one-shot init and for plugins that legitimately can't coalesce.
-
-A typical GPU plugin implements both — `record(cmd, ...)` for the coalesced path (called from the plugin's `record_gpu` callback) and a small `run()` for one-shot init only:
-
-```cpp
-#include <gpu/gpu_pipeline_base.h>
-
-class MyGpuPipeline : public spc::gpu::GpuPipelineBase {
-public:
-    bool init(spc::gpu::VulkanContext& ctx) {
-        if (!init_base(ctx)) return false;   // owned cmd_buf + timeline (for run() only)
-        // create descriptor layout, pipeline, buffers...
-        return true;
-    }
-
-    // Coalesced path: record into the engine-allocated secondary command buffer.
-    // The plugin's record_gpu callback calls this with cmd = the secondary.
-    // out_device / out_staging come from the engine's edge ring (acquire_ringed
-    // _output). out_staging is null on a pure GPU→GPU edge — skip the download.
-    bool record(spc::gpu::VulkanContext& ctx, VkCommandBuffer cmd,
-                const MyPushConstants& params,
-                VkBuffer gpu_input, VkBuffer out_device,
-                VkBuffer out_staging) {
-        spc::gpu::GpuPipelineBase::ScopedExternalRecording scope(*this, cmd);
-        cmd_upload_input(staging_in_, input_buf_, input_bytes_, gpu_input);
-        barrier_transfer_to_compute();
-        cmd_dispatch_compute(ctx, pipeline_, shader_,
-                             layout_, desc_set_,
-                             push_bufs_, push_sizes_, NUM_BUFFERS,
-                             params, groups_x, groups_y);
-        if (out_staging) {
-            barrier_compute_to_transfer();
-            cmd_download_to_staging(out_device, out_staging, output_bytes_);
-        }
-        return true;  // engine submits and waits
-    }
-
-    // Owned path: only used for one-shot init / warmup. Don't call this
-    // from process() on a coalesced plugin — it submits its own command
-    // buffer and steps on the engine's submit cadence.
-    bool run_init(spc::gpu::VulkanContext& ctx, /* ... */) {
-        if (!begin_recording(ctx)) return false;
-        // record dispatches...
-        return submit_and_spin(ctx);
-    }
-
-    const StagingBuffer& output_staging() const { return staging_out_; }
-
-    void destroy(spc::gpu::VulkanContext& ctx) {
-        destroy_base(ctx);
-    }
-};
-```
-
-The plugin's `record_gpu` callback is the bridge from the vtable into the pipeline:
-
-```cpp
-static int record_gpu(SpcPluginInstance* inst, SpcGpuRecordCtx* rctx) {
-    auto* s = state(inst);
-    if (rctx->struct_size < sizeof(SpcGpuRecordCtx)) return -1;
-
-    auto cmd = static_cast<VkCommandBuffer>(rctx->cmd_buffer_handle);
-    auto* in = (rctx->input_count > 0 && rctx->inputs[0].type == SPC_DATA_FRAME)
-                   ? rctx->inputs[0].frame : nullptr;
-    if (!in) return SPC_NO_DATA;
-
-    auto* out = s->host.acquire_gpu_frame(0, in->width, in->height, in->format);
-    if (!out) return -1;
-
-    // edge_ring_ctx is null only for a non-coalesced (own-submit / legacy) node.
-    if (!rctx->edge_ring_ctx) { s->host.release_frame(out); return -1; }
-
-    VkBuffer gpu_input = VK_NULL_HANDLE;
-    if (in->gpu_handle) {
-        if (auto* e = spc::gpu::GpuBufferRegistry::instance().lookup(in->gpu_handle))
-            gpu_input = e->buffer;
-    }
-
-    // Acquire this frame's slot from the engine's K-deep output ring.
-    SpcGpuEdgeBuffer ob = s->host.acquire_ringed_output(
-        rctx->edge_ring_ctx, /*port*/ 0, out->width, out->height, out->stride,
-        out->format, s->pipeline.output_device_size(),
-        s->pipeline.output_staging_size());
-    if (!ob.device_buffer || ob.gpu_handle == 0) {
-        s->host.release_frame(out);
-        return -1;
-    }
-
-    // Record compute into the engine's secondary, writing to ob.device_buffer.
-    // A non-null ob.staging_buffer means this edge has a CPU consumer this
-    // frame — record the device→staging download only then.
-    if (!s->pipeline.record(*s->vk_ctx, cmd, s->params, gpu_input,
-                            static_cast<VkBuffer>(ob.device_buffer),
-                            static_cast<VkBuffer>(ob.staging_buffer))) {
-        s->host.release_frame(out);
-        return -1;
-    }
-
-    // Publish: the engine owns the slot's lifecycle — no GpuOutputHandle.
-    out->gpu_handle   = ob.gpu_handle;
-    out->gpu_flags   |= SPC_GPU_FLAG_RESIDENT;
-    out->frame_number = in->frame_number;
-    out->timestamp_ns = in->timestamp_ns;
-    rctx->outputs[0].type  = SPC_DATA_FRAME;
-    rctx->outputs[0].frame = out;
-    return 0;
-}
-```
-
-**Eager init in `start()` is required for coalesced plugins.** `record_gpu` bypasses `process()`, so any GPU init that previously lived inside `process()` (lazy `vk_ctx = get_shared(); pipeline.init(...)` on the first frame) will never run. Move it to `start()`:
-
-```cpp
-static int start(SpcPluginInstance* inst) {
-    auto* s = state(inst);
-    s->vk_ctx = spc::gpu::VulkanContext::get_shared();
-    if (s->vk_ctx && s->pipeline.init(*s->vk_ctx))
-        s->gpu_available = true;
-    return 0;
-}
-```
-
-If `gpu_available` stays false because eager init was skipped, `record_gpu` returns -1 every frame, the engine cancels the subgraph, and the upstream pool exhausts within seconds.
-
-**Key helpers** (all protected on `GpuPipelineBase`):
-
-| Method | Replaces |
-|--------|----------|
-| `ScopedExternalRecording` | RAII wrapper around `begin_external_recording` / `end_external_recording` |
-| `cmd_dispatch_compute<T>()` | 12-line bind + push constants + dispatch block |
-| `cmd_bind_compute()` | shader_object vs pipeline + push_desc vs descriptor_set branching |
-| `cmd_upload_input()` | VkBufferCopy + conditional source (staging vs device) |
-| `cmd_download_to_staging()` | VkBufferCopy for output readback |
-| `download_output()` | staging invalidate + conditional memcpy |
-| `barrier_compute_to_compute()` | manual VkMemoryBarrier for multi-pass |
-| `copy_to_staging()` / `copy_from_staging()` | stride-aware staging memcpy |
-| `begin_timing()` / `TimingScope` | manual chrono measurement |
-
-#### Accepting GPU-Resident Input
-
-Check `gpu_handle` on the input frame. If set, the frame data is on GPU — use `GpuBufferRegistry::device_copy()` instead of staging upload:
-
-```cpp
-#include <gpu/gpu_buffer_registry.h>
-
-// in process():
-bool input_on_gpu = in->gpu_handle != 0 &&
-                    (in->gpu_flags & SPC_GPU_FLAG_RESIDENT);
-
-VkBuffer gpu_input = VK_NULL_HANDLE;
-if (input_on_gpu) {
-    auto* entry = spc::gpu::GpuBufferRegistry::instance().lookup(in->gpu_handle);
-    if (entry) gpu_input = entry->buffer;
-}
-
-// pass to pipeline — device-copy or staging upload
-pipeline.run(ctx, cpu_data, stride, gpu_input);
-```
-
-Inside the pipeline's `run()`, use `cmd_upload_input()` which handles both paths:
-
-```cpp
-// handles device-to-device (gpu_input != null) or staging upload automatically
-cmd_upload_input(staging_in_, input_buf_, frame_bytes, gpu_input);
-```
-
-#### Producing GPU-Resident Output
-
-A coalesced plugin **emits resident-only output** — it acquires this frame's GPU buffer from the engine's K-deep edge ring, records compute into it, and publishes the handle. The engine owns the device→staging download and decides per-frame whether to record it, so the plugin no longer manages a staging copy or a `GpuOutputHandle`:
-
-```cpp
-// inside record_gpu, after acquiring an output frame `out` from the host pool.
-// edge_ring_ctx is null only for legacy (non-coalesced) nodes — fall back to a
-// self-contained CPU output there.
-if (!rctx->edge_ring_ctx) { s->host.release_frame(out); return -1; }
-
-// Acquire this frame's slot from the engine's K-deep output ring. The engine
-// owns the device + staging buffers (one set per in-flight frame) and registers
-// the staging against the returned gpu_handle, so its post-submit invalidate
-// covers it. Pass the sizes/format the output needs; the ring is allocated
-// lazily and re-allocated on a size change. At K=1 every call returns the same
-// single slot.
-SpcGpuEdgeBuffer ob = s->host.acquire_ringed_output(
-    rctx->edge_ring_ctx, /*port*/ 0, w, h, out->stride, SPC_PIXEL_FORMAT_GRAY8,
-    pipeline.output_device_size(), pipeline.output_staging_size());
-if (!ob.device_buffer || ob.gpu_handle == 0) { s->host.release_frame(out); return -1; }
-
-// Point the output binding at ob.device_buffer and record compute into the
-// engine's secondary command buffer (the coalesced path).
-// The engine hands back a non-null ob.staging_buffer ONLY when this edge has a
-// CPU consumer (a downstream CPU node, preview, or subscription). Record the
-// device→staging download just for that case — a pure GPU→GPU edge stays
-// resident-only with no copy:
-if (ob.staging_buffer) {
-    barrier_compute_to_transfer();
-    cmd_download_to_staging(static_cast<VkBuffer>(ob.device_buffer),
-                            static_cast<VkBuffer>(ob.staging_buffer), out_bytes);
-}
-
-// Publish: point the output frame at the registry handle. No GpuOutputHandle,
-// no manual lifecycle — the engine recycles the slot.
-out->gpu_handle   = ob.gpu_handle;
-out->gpu_flags   |= SPC_GPU_FLAG_RESIDENT;
-out->frame_number = in->frame_number;
-out->timestamp_ns = in->timestamp_ns;
-rctx->outputs[0].type  = SPC_DATA_FRAME;
-rctx->outputs[0].frame = out;
-return 0;
-```
-
-`SpcGpuEdgeBuffer` carries `device_buffer` (the shader binding + transfer endpoint), `device_memory`, `staging_buffer`, the persistently-mapped `staging_mapped` pointer, `staging_size`, and the registry `gpu_handle` (outputs only — uploads return 0). Both accessors return a zeroed struct when the host predates the feature, so check `device_buffer` (and `gpu_handle` for outputs) and fall back to your CPU path. `s->host.has_edge_rings()` gates on support up front.
-
-For a CPU-fed input on the coalesced path, acquire a per-frame upload slot the same way with `s->host.acquire_ringed_upload(rctx->edge_ring_ctx, in_port, device_size, staging_size)` — `memcpy` the CPU frame into `up.staging_mapped`, then record the upload from `up.staging_buffer` into `up.device_buffer`.
-
-When a CPU consumer needs the data, the engine does an instant `memcpy` from the pre-populated staging — no extra GPU submission. After the coalesced submit it invalidates each materialized slot's staging so HOST_CACHED reads see fresh GPU writes.
-
-> **Legacy / own-submit only:** `GpuOutputHandle` (`#include <gpu/gpu_output_handle.h>`) and its `bind_to_frame()` are retained for non-coalesced paths — one-shot init / warmup and `gpu_own_submit()` plugins that read back into their own pooled CPU frames. Coalesced plugins no longer use it.
-
-#### Standard GPU Failure Contract
-
-For the canonical "single input → single output, GPU with CPU fallback" pattern, use `GpuFailureTracker` to handle the device-lost cascade, transient-failure counter, and tear-down policy without writing the boilerplate by hand:
-
-```cpp
-#include <gpu/gpu_failure_tracker.h>
-
-// in plugin state:
-spc::gpu::GpuFailureTracker gpu_failure{"MyPlugin"};  // threshold defaults to 3
-
-// on a successful GPU run:
-s->gpu_failure.note_success();
-return 0;
-
-// on a failed GPU run (inside process(), after release_frame on the
-// acquired output):
-auto action = s->gpu_failure.on_failure(
-    s->vk_ctx, s->vk_pipeline.last_vk_result(), &s->host.cached_log,
-    [&] {
-        s->gpu_available = false;
-        if (s->vk_ctx) {
-            s->gpu_output.release(s->vk_ctx.get());
-            s->vk_pipeline.destroy(*s->vk_ctx);
-            s->vk_ctx.reset();
-        }
-    });
-if (action == spc::gpu::GpuFailureTracker::Action::DeviceLost)
-    return SPC_ERR_DEVICE_LOST;
-// fall through to CPU path
-```
-
-The tracker:
-- probes `ctx->device_lost` and `pipeline.last_vk_result()`
-- logs via the supplied `SpcLogContext` with human-readable `vk_result_str`
-- counts consecutive failures, tears down at threshold (or immediately on `device_lost`)
-- returns `Action::DeviceLost` when the engine should cascade (`SPC_ERR_DEVICE_LOST`) or `Action::Fallback` for the plugin's CPU path
-
-**Plugins with unusual flows** (multi-output ports, mask inputs, multi-pass error handling, custom retry policy) can read `last_vk_result()` and `device_lost` directly and manage state themselves — `GpuFailureTracker` is the convenient default for the common case, not a required contract.
-
-#### Respecting the GPU Toggle
-
-The engine manages `gpu_enabled` (stop-only). Check `acquire_gpu_frame` in host services before entering the GPU path:
-
-```cpp
-#ifdef SPC_HAS_VULKAN
-if (s->host.svc->acquire_gpu_frame && s->gpu_available) {
-    // GPU path
-} else
-#endif
+static int process(SpcPluginInstance* instance, SpcStep* step)
 {
-    // CPU fallback
+    auto* s = state(instance);
+    SpcHost* host = s->host;
+    const SpcData& in_data = step->inputs[0];
+    if (in_data.type != SPC_DATA_FRAME || !in_data.frame) return SPC_INVALID;
+    const SpcFrame* in = in_data.frame;
+    if (in->format != SPC_PIXEL_FORMAT_RGB24) return SPC_INVALID;
+    const uint32_t w = in->width, h = in->height;
+
+    SpcFrame* out = host->frame(host, 0, w, h, SPC_PIXEL_FORMAT_RGB24);
+    if (!out) s->buffer.resize(static_cast<size_t>(w) * h * 3);
+    uint8_t* dst = out ? out->data : s->buffer.data();
+    const uint32_t dst_stride = out ? out->stride : w * 3;
+
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint8_t* src_row = in->data + static_cast<size_t>(y) * in->stride;
+        uint8_t* dst_row = dst + static_cast<size_t>(y) * dst_stride;
+        for (uint32_t x = 0; x < w * 3; ++x)
+            dst_row[x] = static_cast<uint8_t>(std::min(255.0f, src_row[x] * s->gain));
+    }
+
+    SpcData& out_data = step->outputs[0];
+    out_data.type = SPC_DATA_FRAME;
+    if (out) {
+        out->timestamp_ns = in->timestamp_ns;
+        out->sequence = in->sequence;
+        out_data.frame = out;   // the engine's from here on, whatever process() returns
+    } else {
+        s->own = SpcFrame{};
+        s->own.data = s->buffer.data();
+        s->own.width = w;
+        s->own.height = h;
+        s->own.stride = w * 3;
+        s->own.format = SPC_PIXEL_FORMAT_RGB24;
+        s->own.timestamp_ns = in->timestamp_ns;
+        s->own.sequence = in->sequence;
+        out_data.frame = &s->own;   // copied by the engine
+    }
+    return SPC_OK;
 }
 ```
 
-When GPU is disabled, `acquire_gpu_frame` is NULL and the plugin falls through to CPU.
+- **A pool frame on an output belongs to the engine** from then on, whatever `process()` returns. Do not keep using it.
+- **A pool frame not put on an output** goes back with `host->release_frame(host, frame)`.
+- **An input frame passed on unchanged** is shared, not copied: put the input's `SpcFrame*` on the output.
+- **A GPU-resident input** has `gpu_handle` set and `SPC_GPU_FLAG_RESIDENT`. Unless the input is `.gpu_ok()`, the engine gives a CPU plugin the pixels first. A `.gpu_ok()` input that the plugin reads on the CPU after all calls `host->ensure_cpu_data(host, frame)` first.
 
-#### Handling GPU Failures
+### Tables
 
-All GPU submission methods can fail. Always check return values and disable GPU on persistent failure:
+A table is a flat array of records described by a schema, for data on the hot path: detections, tracks, readings. An output table comes from the host: `host->table(host, out, rows)` lends `rows` zeroed records of the output's schema, the host's until `process()` returns. Putting it in the step's outputs publishes it without a copy; a lent table not emitted goes back to the host. The plugin may lower `record_count`, and must not keep, resize or free the table. A plugin emits no other table.
 
 ```cpp
-int result = process_gpu(s, in_frame, outputs);
-if (result == 0) return 0;
-// GPU failed — disable and fall through to CPU
-s->gpu_available = false;
-SPC_LOG_WARN(&s->host.cached_log, "GPU process failed, disabling GPU");
-// ... CPU fallback ...
+enum Output : uint32_t { OUT_BOXES };
+enum { F_X, F_Y, F_W, F_H, F_SCORE };   // the output's fields, in declaration order
+
+// .output_table("boxes", "Boxes", {{"x", SPC_FIELD_FLOAT}, {"y", SPC_FIELD_FLOAT},
+//                                  {"w", SPC_FIELD_FLOAT}, {"h", SPC_FIELD_FLOAT},
+//                                  {"score", SPC_FIELD_FLOAT}})
+
+SpcTable* out = host->table(host, OUT_BOXES, count);
+if (!out) return SPC_FAILED;
+const uint32_t* off = out->field_offsets;   // where each field is in a record
+for (uint32_t i = 0; i < count; ++i) {
+    spc_table_set_float(out, i, off[F_X], boxes[i].x);
+    spc_table_set_float(out, i, off[F_Y], boxes[i].y);
+    spc_table_set_float(out, i, off[F_W], boxes[i].w);
+    spc_table_set_float(out, i, off[F_H], boxes[i].h);
+    spc_table_set_float(out, i, off[F_SCORE], boxes[i].score);
+}
+out->timestamp_ns = in->timestamp_ns;
+out->sequence = in->sequence;
+step->outputs[OUT_BOXES].type = SPC_DATA_TABLE;
+step->outputs[OUT_BOXES].table = out;
 ```
 
-Inside GPU pipelines, `submit_and_wait()` / `submit_and_spin()` return `false` on:
-- `VK_ERROR_DEVICE_LOST` — sets `ctx.device_lost` flag, all subsequent GPU calls bail immediately
-- Queue submission failure
-- Semaphore wait timeout (5s for spin, configurable for wait)
+`host->table()` returns null for a port that is not a table or signal output, or a size over `SPC_TABLE_MAX_BYTES`.
 
-`GpuPipelineBase` checks `device_lost` at entry to `begin_recording()`, `submit_and_wait()`, `submit_and_spin()` — no wasted work after a GPU failure.
+An input table is laid out by its producer. Its `field_offsets` has one entry per field the **input** declares, in declaration order, so the plugin indexes it with an enum of its own fields. An optional field the producer does not send is `SPC_NO_FIELD`:
 
-**Engine-side `record_gpu` failure handling.** The coalesced path adds a layer above plugin-level failure handling:
+```cpp
+// .input_table("boxes_in", "Boxes", {{"x", SPC_FIELD_FLOAT}, {"y", SPC_FIELD_FLOAT}})
+//     .optional_fields({{"class_name", SPC_FIELD_STRING32}})
+enum { F_X, F_Y, F_CLASS_NAME };
 
-- `record_gpu` is invoked under SEH guard (`guarded_record_gpu`). A crash inside the plugin's recording is caught, the frame is canceled for the whole subgraph, and the offending plugin is demoted (single strike on SEH).
-- A non-zero return from `record_gpu` is treated as a soft failure. After `kRecordGpuFailThreshold` (= 3) consecutive soft failures the engine demotes the plugin out of the subgraph.
-- **Demotion** clears `ctx->subgraph_executor` and `ctx->gpu_active` for the offending member; subsequent iterations route through the plugin's `process()` (CPU fallback). Sibling members in the subgraph keep running.
-- The return value contract for `record_gpu`: `0` = success, non-zero = "fail this frame for the whole subgraph". For permanent device failure, set `ctx.device_lost` so the watchdog escalates to a profile rebuild.
-- **`SPC_NO_DATA` exception**: "no frame this tick" (live-stream stall, exposure still in flight, reconnect backoff window) cancels the frame but does **not** count toward the demote, and in `process()` it skips the error-backoff entirely (the engine retries after a short fixed poll, `kNoDataPollInterval`). Return it for transient input droughts so a hiccup never permanently costs the GPU path; return a real error for anything that should back off, demote, or reach the watchdog.
-
-#### CMake Setup
-
-```cmake
-spc_add_plugin(my_filter SOURCES my_filter_plugin.cpp)
-target_link_libraries(my_filter PRIVATE SpeculorSDK::spclib)
-
-if(SPC_VULKAN_FOUND AND SPC_GLSLANG_VALIDATOR)
-    spc_enable_gpu(my_filter)
-    spc_add_gpu_shaders(my_filter SHADERS my_compute.comp)
-    target_sources(my_filter PRIVATE my_gpu_pipeline.h my_gpu_pipeline.cpp)
-endif()
+const SpcData& in = step->inputs[IN_BOXES];
+if (in.type == SPC_DATA_TABLE && in.table) {
+    const SpcTable* tbl = in.table;
+    const uint32_t* off = tbl->field_offsets;
+    for (uint32_t i = 0; i < tbl->record_count; ++i) {
+        const float x = spc_table_get_float(tbl, i, off[F_X]);
+        const float y = spc_table_get_float(tbl, i, off[F_Y]);
+        const char* name = off[F_CLASS_NAME] != SPC_NO_FIELD
+                               ? spc_table_get_string(tbl, i, off[F_CLASS_NAME]) : "";
+        // ...
+    }
+}
 ```
 
-`SPC_VULKAN_FOUND` and `SPC_GLSLANG_VALIDATOR` are set by `find_package(SpeculorSDK)` — the bundle ships the Vulkan loader/headers and `glslangValidator`, so a GPU plugin needs no separately installed Vulkan SDK.
+**Columns decided at run time** (a database query's result): declare the output with no fields, then give it a schema with `set_output_schema` from `start()` or `process()`, again whenever the columns change. The host keeps a copy:
+
+```cpp
+spc::SchemaStorage columns;   // schema_storage.h owns the fields and their ids
+columns.add_field("name", SPC_FIELD_STRING64);
+columns.add_field("value", SPC_FIELD_FLOAT64);
+host->set_output_schema(host, OUT_ROWS, columns.get());
+```
+
+The table accessors are in `speculor/table_helpers.h`: `spc_table_get_*` and `spc_table_set_*` for every field type, `spc_table_get_string` / `spc_table_set_string` for fixed-size strings, and `spc_table_walk` to visit every field of every record.
+
+**Decimal fields** (`SPC_FIELD_DECIMAL`, `SpcDecimal`) hold exact values: a 64-bit mantissa and a scale, value = mantissa / 10^scale. `spc::spc_decimal_make(19999, 2)` is 199.99, and `spc::spc_decimal_to_string()` formats one (`decimal_helpers.h`).
+
+### Signals
+
+A signal carries sample blocks (audio, SDR I/Q) too fast to step the consumer once per block. The producer emits each block as a table lent by the host, with the output's type set to `SPC_DATA_SIGNAL`. The host copies the block for every reader and holds it until the reader takes it, so nothing of the consumer runs on the producer's thread.
+
+Producer:
+
+```cpp
+SpcTable* out = host->table(host, OUT_SAMPLES, count);
+if (!out) return SPC_FAILED;
+const uint32_t* off = out->field_offsets;
+for (uint32_t i = 0; i < count; ++i)
+    spc_table_set_float(out, i, off[F_AMPLITUDE], next_sample());
+out->sample_rate_hz = sample_rate;   // per-block metadata: rate, frequency, gain...
+out->timestamp_ns = host->now_utc_ns(host);
+out->sequence = ++s->blocks;
+step->outputs[OUT_SAMPLES].type = SPC_DATA_SIGNAL;
+step->outputs[OUT_SAMPLES].table = out;
+```
+
+Consumer, at the top of `process()`:
+
+```cpp
+while (const SpcTable* block = host->take_signal(host, IN_SIGNAL)) {
+    const uint32_t off = block->field_offsets[F_IN_AMPLITUDE];
+    for (uint32_t i = 0; i < block->record_count; ++i)
+        push(spc_table_get_float(block, i, off));
+}
+```
+
+- A block is valid until the next `take_signal` on the same port.
+- One thread at a time takes from a port: the node's own, or one the plugin owns, such as an audio device callback.
+- The host holds `SPC_SIGNAL_QUEUE_RECORDS` records per signal input. When a slower reader lets that fill, the block that does not fit is dropped whole.
+- A mono input (`{amplitude}`) can read a stereo output (`{amplitude, right}`): the input reads the fields it declares.
+
+### JSON
+
+`SpcJson` carries a JSON string, for metadata off the hot path. The string is the plugin's own; the engine copies it after `process()` returns, so keep it in the instance:
+
+```cpp
+s->json_text = make_json(...);   // a std::string member
+s->json.json = s->json_text.c_str();
+s->json.length = static_cast<uint32_t>(s->json_text.size());
+step->outputs[OUT_META].type = SPC_DATA_JSON;
+step->outputs[OUT_META].json = &s->json;
+```
+
+### Packets
+
+`SpcPacket` carries a compressed bitstream captured before decoding, for recording or forwarding video without encoding it again. H.264 and HEVC payloads are Annex-B. `flags` marks keyframes (`SPC_PACKET_FLAG_KEYFRAME`), codec configuration (`_CONFIG`), timeline breaks (`_DISCONTINUITY`), audio (`_AUDIO`, with `sample_rate` and `channels`) and batched audio frames (`_BATCH`). After a gap a consumer discards packets until the next keyframe. The payload is the plugin's own and is copied; packet inputs are always FIFO.
+
+### Scalars
+
+A scalar is one typed value: set `scalar.type` to an `SpcFieldType` and the matching member (`f32`, `f64`, `i32`, `b`, `dec`, ...). Reading an input, `spc::input_scalar(step->inputs, step->input_count, port)` returns it as a float whatever its type (`io_helpers.h`).
+
+### Control
+
+A control output sends commands to the nodes connected to it: set a parameter, ask for one or all of them, apply a preset. The plugin never builds a message; it calls the host:
+
+```cpp
+SpcValue v{};
+v.f = 1.5f;
+host->control(host, OUT_CMD, SPC_CONTROL_SET, "gain", SPC_PARAM_FLOAT, &v, /*request_id*/ 0);
+
+// the same through the SDK's convenience
+spc::ControlOut(host, OUT_CMD, 0).set_float("gain", 1.5f);
+```
+
+- `kind` is `SPC_CONTROL_SET`, `_GET`, `_LIST` or `_PRESET`. Add `SPC_CONTROL_AS_USER` to a SET or PRESET that is the operator's own edit, made on the sender's panel: the project keeps it like a change made in Node Properties.
+- An ENUM is set by position (`choice.index`).
+- The host sends the commands once `process()` returns. Commands of one kind and request id made in one step travel and are answered together.
+- With `request_id` 0 a SET gets no reply. With another id the reply comes to the `control_reply` slot, on the node's thread between steps: `SpcControlReply` says, per parameter, whether the target took it (ACK), or holds the values and declarations asked for (VALUES). It is valid during the call only. `spc::control_ack_find(reply, name, &rc)` reads one ACK entry.
+
+The target plugin does nothing to receive commands: the host applies them to its parameters, and it sees `params_changed`.
+
+### Events
+
+An event marks something notable: a track acquired, an object entering a zone, a threshold crossed. The host stamps it on the shared clock, attributes it to the node, records it in the session and shows it in the GUI. Events are for low-frequency moments; per-frame data belongs in the node's outputs.
+
+```cpp
+SpcEvent e{};
+e.category = SPC_FOURCC('T', 'H', 'R', 'S');   // a kind of the plugin's own
+e.severity = SPC_EVENT_WARNING;
+e.phase = SPC_EVENT_BEGIN;                     // BEGIN and END with one id make a span
+e.id = s->next_id++;
+e.label = "Above threshold";
+e.detail = detail;                             // the host copies the strings during the call
+host->emit_event(host, &e);
+```
+
+- `timestamp_ns` and `sequence` left 0 are stamped by the host: the clock's time and the sequence of the input being processed. A source sets the sequence of the frame the event is about.
+- `SPC_EVENT_HAS_REGION` with `x, y, w, h` (normalized) marks a region of the frame; `SPC_EVENT_HAS_GEO` with `lat, lon, alt` a place.
+- A string longer than its limit (`SPC_EVENT_LABEL_MAX`, `_DETAIL_MAX`, `_DATA_MAX`, nul included) is refused, not cut.
+- `emit_event_snapshot` also attaches a thumbnail: the host crops the normalized region from the frame's CPU pixels, scales and encodes it on a worker thread, and returns at once.
+
+### UI input
+
+A plugin whose view the user clicks or types into implements `ui_input`. The host queues each input and calls the slot on the node's thread, between steps:
+
+```cpp
+static void ui_input(SpcPluginInstance* instance, const SpcUiInput* input)
+{
+    auto* s = state(instance);
+    if (input->type == SPC_UI_MOUSE_PRESS && input->mouse.button == SPC_MOUSE_BUTTON_LEFT)
+        s->click = {input->mouse.x, input->mouse.y};   // normalized [0,1] over the frame
+    else if (input->type == SPC_UI_KEY_PRESS && input->key.key_code == SPC_KEY_ESCAPE)
+        s->click.reset();
+}
+```
+
+`display_size` gives the pixel size of the widget showing the node, for a plugin that relates frame pixels to screen pixels.
+
+### Ownership
+
+| What | Owned by | Valid until |
+|---|---|---|
+| `SpcNodeInfo` and all it points at | the plugin | the library is unloaded, unchanged |
+| a port's schema | the plugin | the library is unloaded |
+| a schema passed to `set_output_schema` | the caller; the host keeps a copy | the call returns |
+| the step's inputs | the host | the call returns |
+| a table from `host->table()` | the host | the call returns; emitted, it is published |
+| a frame from `host->frame()` | the host | put on an output, it is the engine's; otherwise until released |
+| a block from `take_signal` | the host | the next `take_signal` on the port |
+| an event and its strings | the caller; the host copies them | the call returns |
+| `SpcHost` | the host | `stop()` returns |
+| `SpcGpuPass` | the host, one per instance | `stop()` returns |
+| `SpcGpuDevice` | the host | `stop()`, or while the plugin holds a retain |
+| values handed to `start` / `params_changed` | the host | the call returns |
+| a control reply | the host | the call returns |
+
+### Limits
+
+| Limit | Value | Of |
+|---|---|---|
+| `SPC_PORT_MAX` | 16 | inputs, and outputs, per node |
+| `SPC_PLUGIN_PARAM_MAX` | 64 | parameters per node |
+| `SPC_PARAM_NAME_MAX` | 64 | a parameter's id, label and group, nul included |
+| `SPC_PARAM_STRING_MAX` | 256 | a STRING value, and a parameter's help |
+| `SPC_PARAM_TEXT_MAX` | 4096 | a TEXT value |
+| `SPC_PARAM_ENUM_MAX` | 32 | options of an ENUM |
+| `SPC_PARAM_ENUM_LABEL_MAX` / `SPC_PARAM_ENUM_ID_MAX` | 32 / 48 | an option's label / id |
+| `SPC_LIST_SCHEMA_MAX` | 4 | LIST parameters per node |
+| `SPC_LIST_COL_MAX` / `SPC_LIST_ROW_MAX` | 8 / 256 | columns / rows of a LIST |
+| `SPC_FIELD_NAME_MAX` | 64 | a field's id, nul included |
+| `SPC_SCHEMA_MAX_FIELDS` | 48 | fields per schema |
+| `SPC_TABLE_MAX_BYTES` | 256 MiB | one table |
+| `SPC_JSON_MAX_BYTES` | 16 MiB | one JSON output |
+| `SPC_PACKET_MAX_BYTES` | 64 MiB | one packet |
+| `SPC_SIGNAL_QUEUE_RECORDS` | 1,048,576 | records the host holds per signal input |
+| `SPC_EVENT_LABEL_MAX` / `_DETAIL_MAX` / `_DATA_MAX` | 64 / 192 / 512 | an event's strings, nul included |
+| `SPC_TAG_MAX` / `SPC_TAG_NAME_MAX` | 8 / 32 | domain tags per node, and their length |
 
 ---
 
-## Two-Phase Shutdown
+## The Clock
 
-Pipeline shutdown is a two-phase protocol because plugins do two different things on stop, and they need to happen at different times relative to the per-node worker thread:
+The engine keeps one clock, with two timelines, and every plugin reads the same one. That is what lets data from different sensors, and from different machines, be aligned in time.
 
-| Phase | Vtable slot | When the engine calls it | What the plugin must do |
-|------|-------------|---------------------------|--------------------------|
-| 1 — abort signal | `request_stop` (optional) | **Before** `wait_for_process_drain` — concurrently with an in-flight `process()` / `record_gpu` | Set atomic flags only. Kick interrupt callbacks (FFmpeg `AVIOInterruptCB`, `shutdown(socket)`). Return immediately. **Do not free anything the worker is still reading.** |
-| 2 — teardown | `stop` (optional) | **After** `wait_for_process_drain` — the worker is no longer inside `process()` / `record_gpu` | Free resources, close devices, reset shared_ptrs. Free to do destructive work — the worker is out. |
+- **`host->now_utc_ns(host)`**: disciplined UTC nanoseconds, the timeline of every `timestamp_ns`.
+- **`host->now_mono_ns(host)`**: monotonic nanoseconds, which never step back. Use it, or `std::chrono::steady_clock`, for intervals and pacing, never for a timestamp.
+- **`host->time(host, &info)`**: both readings in one `SpcTimeInfo`, with the source the clock follows (`sync_source`), whether it is locked to it, and how far the UTC reading may be from it (`est_error_ns`).
 
-The split exists because folding both into `stop()` would force the teardown half to race with concurrent `process()`/`record_gpu` calls. For plugins that hold an FFmpeg `AVFormatContext`, freeing the context (`avformat_close_input`) while another thread is mid-`h264_parse` is undefined behavior and crashes hard. The two-phase protocol mirrors the standard cancel+join pattern: signal first, destroy after.
+A source stamps the moment of capture, when its device reports one. A filter passes its input's timestamp on.
 
-### When to implement `request_stop`
-
-You need it when your `process()` / `record_gpu` can block on something that *only an external poke can unblock*:
-
-- FFmpeg `av_read_frame` on an RTSP/HTTP source with a stalled connection.
-- Blocking `recv()` on a TCP socket waiting for a peer that never sends.
-- Long `WaitForSingleObject` / `pthread_cond_wait` on something the engine's `stop_token` doesn't reach.
-
-You don't need it for plugins whose worker is naturally bounded — pure compute, queue-driven processing, fast device reads. The engine's `stop_token` and queue shutdown alone are enough; leave the slot null.
-
-If a plugin that needs `request_stop` doesn't have it, `wait_for_process_drain` will time out (3s), the worker may still be wedged when teardown runs, and you risk SEH crashes on freed state.
-
-### Example — an RTSP video source
+**Steering the clock.** A plugin that reads a time reference, such as a GPS receiver's pulse, feeds corrections to the engine clock:
 
 ```cpp
-static int request_stop(SpcPluginInstance* inst) {
-    auto* s = state(inst);
-    s->stop_requested.store(true, std::memory_order_release);
-    if (s->reader) s->reader->request_stop();   // kicks FFmpeg AVIOInterruptCB
-    return 0;
-}
-
-static int stop(SpcPluginInstance* inst) {
-    auto* s = state(inst);
-    // Phase 2 — teardown. Worker is guaranteed to be out of process()/record_gpu.
-    s->reader.reset();        // free demuxer, hwaccel state
-    if (s->vk_ctx) { s->pipeline.destroy(*s->vk_ctx); s->vk_ctx.reset(); }
-    return 0;
-}
-
-SPC_PLUGIN_VTABLE(
-    .get_descriptor     = get_descriptor,
-    .create_instance    = create_instance,
-    .destroy_instance   = destroy_instance,
-    .set_parameter      = set_parameter,
-    .get_parameter      = get_parameter,
-    .process            = process,
-    .start              = start,
-    .stop               = stop,
-    .set_host_services  = set_host_services,
-    .validate_mandatory = validate_mandatory,
-    .record_gpu         = record_gpu,
-    .request_stop       = request_stop
-)
+SpcClockCorrection c{};
+c.target_utc_ns = pulse_utc_ns;   // what UTC should read...
+c.at_mono_ns = pulse_mono_ns;     // ...at this monotonic instant
+c.est_error_ns = 1000;            // the correction's error bound
+c.sync_source = SPC_SYNC_GPS_PPS;
+host->discipline_clock(host, &c);
 ```
 
-Add `.validate_mandatory`, `.request_stop`, and `.record_gpu` only if you need them — `SPC_PLUGIN_VTABLE` defaults every unmentioned slot to `nullptr`.
-
----
-
-## Working with Tables
-
-Tables are schema-described binary flat arrays, designed for the hot path (detections, tracks, sensor readings).
-
-### Declaring the Schema
-
-Declare table schemas in your descriptor's port definitions:
-
-```cpp
-.output_table("detections", "Detections", {
-    {"x", SPC_FIELD_FLOAT},
-    {"y", SPC_FIELD_FLOAT},
-    {"w", SPC_FIELD_FLOAT},
-    {"h", SPC_FIELD_FLOAT},
-    {"confidence", SPC_FIELD_FLOAT},
-})
-```
-
-Available field types: `SPC_FIELD_FLOAT`, `SPC_FIELD_INT32`, `SPC_FIELD_UINT32`, `SPC_FIELD_BOOL`, `SPC_FIELD_INT8`, `SPC_FIELD_UINT8`, `SPC_FIELD_INT16`, `SPC_FIELD_UINT16`, `SPC_FIELD_FLOAT64`, `SPC_FIELD_INT64`, `SPC_FIELD_UINT64`, `SPC_FIELD_STRING32`, `SPC_FIELD_STRING64`, `SPC_FIELD_STRING128`, `SPC_FIELD_STRING256`, `SPC_FIELD_DECIMAL`.
-
-#### Decimal Fields
-
-Use `SPC_FIELD_DECIMAL` for exact financial/monetary values that cannot tolerate float rounding. The `SpcDecimal` struct is 16 bytes: `int64_t mantissa` + `int16_t scale` + padding. Value = mantissa / 10^scale.
-
-```cpp
-// table output with decimal field
-.output_table("out", "Output", {
-    {"symbol", SPC_FIELD_STRING32},
-    {"price", SPC_FIELD_DECIMAL},
-    {"volume", SPC_FIELD_INT64},
-})
-
-// write/read decimal fields
-SpcDecimal price = spc::spc_decimal_make(19999, 2);  // 199.99
-spc_table_set_decimal(&table, row, price_offset, price);
-SpcDecimal got = spc_table_get_decimal(&table, row, price_offset);
-
-// format for display/JSON (always as string, never as JSON number)
-char buf[32];
-spc::spc_decimal_to_string(price, buf, sizeof(buf));  // "199.99"
-
-// decimal parameter
-.decimal_param("price", "Price",
-    spc::spc_decimal_make(0, 2),       // min
-    spc::spc_decimal_make(9999999, 2), // max
-    spc::spc_decimal_make(0, 2),       // default
-    spc::spc_decimal_make(1, 2))       // step (0.01)
-```
-
-### Producing Table Data
-
-```cpp
-// in your state struct
-SpcTable output_table{};
-uint32_t offsets[5]{};    // one per field
-uint32_t stride{};
-
-// in create_instance — precompute offsets from the schema
-auto* desc = get_descriptor();
-spc_schema_compute_offsets(&desc->ports[0].schema, s->offsets, &s->stride);
-spc_table_init(&s->output_table, s->stride, &desc->ports[0].schema);
-
-// in process — fill the table
-spc_table_resize(&s->output_table, detection_count);
-for (uint32_t i = 0; i < detection_count; ++i) {
-    spc_table_set_float(&s->output_table, i, s->offsets[0], detections[i].x);
-    spc_table_set_float(&s->output_table, i, s->offsets[1], detections[i].y);
-    spc_table_set_float(&s->output_table, i, s->offsets[2], detections[i].w);
-    spc_table_set_float(&s->output_table, i, s->offsets[3], detections[i].h);
-    spc_table_set_float(&s->output_table, i, s->offsets[4], detections[i].conf);
-}
-spc::set_table_output(outputs[0], &s->output_table);
-
-// in destroy_instance — free the table
-spc_table_free(&s->output_table);
-```
-
-### Consuming Table Data
-
-```cpp
-const auto* table = spc::input_table(inputs, input_count, 0);
-if (!table || table->record_count == 0) return 0;
-
-// resolve field offsets by name (do this once, cache in state)
-uint32_t off_x = spc_schema_field_offset(table->schema, "x");
-uint32_t off_y = spc_schema_field_offset(table->schema, "y");
-
-for (uint32_t i = 0; i < table->record_count; ++i) {
-    float x = spc_table_get_float(table, i, off_x);
-    float y = spc_table_get_float(table, i, off_y);
-    // ...
-}
-```
-
-### Table Lifecycle Functions
-
-| Function | Purpose |
-|----------|---------|
-| `spc_table_init(table, stride, schema)` | Initialize a table with a given stride and schema pointer |
-| `spc_table_resize(table, count)` | Set the record count; allocates/reallocates if needed. Returns 0 on success. |
-| `spc_table_clear(table)` | Reset record count to 0 without freeing memory |
-| `spc_table_free(table)` | Free the data buffer and reset all fields |
-
----
-
-## Signal Ports
-
-Signals are direct-call connections for high-throughput data (audio samples, SDR IQ data). Unlike table ports where the engine copies data through queues, signal data is passed by pointer directly from the producer's `process()` thread to the consumer's `on_signal()` callback.
-
-### When to Use Signals vs Tables
-
-- **Tables**: Engine copies data through queues. Safe for different-rate producers/consumers. Use for detection results, track lists, metadata.
-- **Signals**: Zero-copy direct call. Producer and consumer must run at compatible rates. Use for audio, SDR, high-frequency sensor data.
-
-### Declaring Signal Ports
-
-```cpp
-// mono producer
-.output_signal("samples_out", "Samples", {
-    {"amplitude", SPC_FIELD_FLOAT},
-})
-.streaming()
-
-// mono consumer
-.input_signal("samples_in", "Samples", {
-    {"amplitude", SPC_FIELD_FLOAT},
-})
-
-// stereo producer (convention: amplitude=left, right=right)
-.output_signal("audio_out", "Audio Out", {
-    {"amplitude", SPC_FIELD_FLOAT},
-    {"right", SPC_FIELD_FLOAT},
-})
-
-// stereo consumer
-.input_signal("audio_in", "Audio In", {
-    {"amplitude", SPC_FIELD_FLOAT},
-    {"right", SPC_FIELD_FLOAT},
-})
-```
-
-Mono consumers (`{amplitude}`) can connect to stereo outputs via structural subtyping — they receive only the left channel.
-
-Declaring an `input_signal` automatically sets `SPC_CAP_SIGNAL_INPUT`.
-
-### Implementing `on_signal`
-
-The consumer implements an `on_signal` handler, typically using `SpcRingBuffer` to decouple the producer's thread from the consumer's process thread:
-
-```cpp
-// in state struct
-SpcRingBuffer* ring = nullptr;
-
-// in create_instance
-s->ring = spc_ring_create(8192, stride);
-
-// signal handler — called from producer's thread
-static int handle_signal(MyState* s, uint32_t port_index, const SpcTable* data) {
-    if (!data || !data->data) return -1;
-    spc_ring_write(s->ring, data->data, data->record_count);
-    return 0;
-}
-SPC_PLUGIN_SIGNAL_CALLBACK(MyState, handle_signal)
-
-// in process — drain the ring buffer on the consumer's thread
-uint32_t available = spc_ring_available(s->ring);
-// ... read and process
-```
-
-### Thread Safety Contract
-
-- `on_signal` is called from the **producer's thread**, not the consumer's process thread.
-- The `data` pointer is only valid for the duration of the `on_signal` call.
-- Use `SpcRingBuffer` (lock-free SPSC) to safely transfer data between threads.
-- Do not do heavy work inside `on_signal` — copy the data and return.
+The engine ranks corrections by their source with its own time sources, and the better source holds the clock for as long as it keeps reporting: a GPS pulse outranks NTP and the system clock. Corrections are applied gradually; the clock steps only on first lock or a large error.
 
 ---
 
 ## Logging
 
-Plugins log through the host's logging system using the `SPC_LOG_*` macros. These require a pointer to an `SpcLogContext`, which is automatically populated when you use `SPC_PLUGIN` or `SPC_PLUGIN_HOST_SERVICES`:
+`host->log(host, level, message)` writes a line attributed to the node. The SDK's printf-style macros go through it:
 
 ```cpp
-auto* s = state(inst);
-SPC_LOG_INFO(&s->host.cached_log, "Processing frame %llu at %dx%d",
-             static_cast<unsigned long long>(frame->frame_number),
-             frame->width, frame->height);
-
-SPC_LOG_ERROR(&s->host.cached_log, "Failed to open device: %s", error_msg);
-SPC_LOG_WARN(&s->host.cached_log, "Buffer overflow, dropping %u samples", dropped);
-SPC_LOG_DEBUG(&s->host.cached_log, "Phase: %.4f", phase);
+s->log = spc::log_context(host);   // in start(): an SpcLogContext that logs through the host
+SPC_LOG_INFO(&s->log, "opened %s at %u fps", name, fps);
+SPC_LOG_WARN(&s->log, "device busy, retrying");
 ```
 
-The macros use `printf`-style formatting. Log levels:
-
-| Macro | Level | Use Case |
-|-------|-------|----------|
-| `SPC_LOG_DEBUG` | Debug | Detailed diagnostic info, disabled in release |
-| `SPC_LOG_INFO` | Info | Normal operational messages |
-| `SPC_LOG_WARN` | Warning | Recoverable issues |
-| `SPC_LOG_ERROR` | Error | Failures that affect plugin operation |
-
-If host services are not yet injected (or the host does not provide logging), the macros are safe to call — they silently do nothing.
+Levels are `SPC_LOG_LEVEL_DEBUG`, `_INFO`, `_WARN` and `_ERROR`, and `SPC_LOG_DEBUG` / `_INFO` / `_WARN` / `_ERROR` match them. The macros format into a 512-byte line. spclib keeps its log sink per thread: call `spc::install_spclib_log_bridge(&s->log)` (`speculor/spclib_log_bridge.h`) at the top of `process()` before calling into it.
 
 ---
 
-## Exporting the VTable
+## GPU Plugins
 
-Use `SPC_PLUGIN_VTABLE(...)` to emit the `spc_plugin_vtable` symbol. It uses C++20 designated initializers: list only the slots your plugin implements, and the rest default to `nullptr`. Field order must match `SpcPluginVTable`'s declaration order in `plugin_api.h`.
+### How a node uses a GPU
 
-The full slot list, in declaration order:
+A plugin declares its GPU use in the node info, one `SpcGpuUse`:
 
-| Slot | When to set |
-|---|---|
-| `get_descriptor` | Always — required |
-| `create_instance` | Always — required |
-| `destroy_instance` | Always — required |
-| `set_parameter` | Always — wire to your auto-params or hand-written setter |
-| `get_parameter` | Always — wire to your auto-params or hand-written getter |
-| `process` | Always — required |
-| `start` | Streaming sources that need lifecycle |
-| `stop` | Pairs with `start` |
-| `set_host_services` | If plugin uses logging or frame allocation |
-| `on_signal` | Plugin consumes `SPC_DATA_SIGNAL` input ports |
-| `on_input_event` | Interactive plugin (mouse/keyboard) |
-| `scan_devices` | Plugin enumerates hardware (e.g. SDR, cameras) |
-| `on_control_response` | Plugin receives control-channel replies |
-| `get_list_rows` | Plugin has list parameters |
-| `set_list_rows` | Pairs with `get_list_rows` |
-| `validate_mandatory` | Plugin has *conditional* mandatory params; omit for declarative `.mandatory()` (engine runs default check) |
-| `record_gpu` | Plugin opts into engine-driven coalesced GPU submit |
-| `request_stop` | Plugin's `process()`/`record_gpu` can block on uninterruptible I/O |
+| `SpcNodeInfo::gpu` | Builder | Frames it takes | Where it computes |
+|---|---|---|---|
+| `SPC_GPU_NONE` | | CPU | CPU |
+| `SPC_GPU_RECORDED` | `.gpu_compute()` | GPU-resident | in `record_gpu`, into the engine's command buffer, which the engine submits once for a chain of GPU nodes |
+| `SPC_GPU_OWN_SUBMIT` | `.gpu_own_submit()` | GPU-resident | records and submits on its own (a fence wait on a dedicated queue); never fused with other nodes |
+| `SPC_GPU_OWN_API` | `.gpu_own_api()` | CPU | through an API of its own (ONNX Runtime, CUDA) |
 
-### Most common shapes
+Every value but `NONE` gives the node a GPU switch: the `gpu_enabled` and `gpu_profile` parameters, which the engine adds and owns, a null `host->gpu()` while the node's GPU is off, and a restart on the node's CPU path when it runs out of restarts on the GPU.
 
-**CPU filter** — no lifecycle, no GPU, no event handling:
+A RECORDED or OWN_SUBMIT node gets its GPU-resident frames in `record_gpu`, so a plugin declares either only where it implements `record_gpu`. A build without Vulkan has no `record_gpu`, so it declares no GPU use:
 
 ```cpp
-SPC_PLUGIN_VTABLE(
-    .get_descriptor    = get_descriptor,
-    .create_instance   = create_instance,
-    .destroy_instance  = destroy_instance,
-    .set_parameter     = set_parameter,
-    .get_parameter     = get_parameter,
-    .process           = process,
-    .set_host_services = set_host_services
+SPC_PLUGIN_DESCRIPTOR(
+    spc::DescriptorBuilder("my_bgs", "My BGS", "Analysis/Motion")
+        .input("image_in", "Image", SPC_DATA_FRAME, 32, SPC_CONSUME_FIFO)
+        .output("mask_out", "Mask", SPC_DATA_FRAME)
+        SPC_IF_VULKAN(.gpu_compute())
 )
 ```
 
-**Streaming source** — camera, network feed, file reader:
+Conformance fails a plugin that declares RECORDED or OWN_SUBMIT with no `record_gpu` (`descriptor.gpu_records`).
 
-```cpp
-SPC_PLUGIN_VTABLE(
-    .get_descriptor    = get_descriptor,
-    .create_instance   = create_instance,
-    .destroy_instance  = destroy_instance,
-    .set_parameter     = set_parameter,
-    .get_parameter     = get_parameter,
-    .process           = process,
-    .start             = start,
-    .stop              = stop,
-    .set_host_services = set_host_services
-)
+### The lent device
+
+The engine owns each Vulkan device and lends a node the one it runs on. `host->gpu(host)` returns its `SpcGpuDevice`: the Vulkan instance, physical device and device, the queue families, the enabled extensions, queue locks, a shared lost flag, and `retain` / `release`. Its handles are all null when the host has no Vulkan device for the node. A null `gpu()` means the node's GPU is off, because the user switched it off or the watchdog moved the node to its CPU path: take the CPU path.
+
+A Vulkan plugin uses `spc::gpu::context_from_host(host)` (`gpu/gpu_host.h`), which wraps the lent device as a `VulkanContext`, retained until it is let go, and is null when the node's GPU is off or there is no device. The plugin builds what it needs on the device in `start()`, and destroys it in `stop()` before it lets the device go. A plugin that submits or waits on a queue itself brackets the call with `lock_queue` / `unlock_queue`, since every node on the device shares its queues. One that gets `VK_ERROR_DEVICE_LOST` calls `mark_lost` and makes no further Vulkan call once `is_lost` is set.
+
+### record_gpu
+
+```c
+int (*record_gpu)(SpcPluginInstance* instance, SpcStep* step, SpcGpuPass* pass);
 ```
 
-**Coalesced GPU filter** with start/stop (the common GPU plugin shape — eager init in `start()` is required because `record_gpu` bypasses `process()`):
+For a RECORDED node that is on its GPU path, the engine calls `record_gpu` instead of `process()`, on the node's thread, with the same step. `pass->cmd_buffer_handle` is a `VkCommandBuffer` the engine owns.
 
-```cpp
-SPC_PLUGIN_VTABLE(
-    .get_descriptor    = get_descriptor,
-    .create_instance   = create_instance,
-    .destroy_instance  = destroy_instance,
-    .set_parameter     = set_parameter,
-    .get_parameter     = get_parameter,
-    .process           = process,
-    .start             = start,
-    .stop              = stop,
-    .set_host_services = set_host_services,
-    .record_gpu        = record_gpu
-)
-```
-
-**GPU source with blocking I/O and conditional mandatory params** (the typical network video-source shape):
-
-```cpp
-SPC_PLUGIN_VTABLE(
-    .get_descriptor     = get_descriptor,
-    .create_instance    = create_instance,
-    .destroy_instance   = destroy_instance,
-    .set_parameter      = set_parameter,
-    .get_parameter      = get_parameter,
-    .process            = process,
-    .start              = start,
-    .stop               = stop,
-    .set_host_services  = set_host_services,
-    .validate_mandatory = validate_mandatory,
-    .record_gpu         = record_gpu,
-    .request_stop       = request_stop
-)
-```
-
-### Conditional slots
-
-Preprocessor directives (`#ifdef`, `#if`) cannot appear inside the macro arguments. To conditionally include a slot, route it through a helper macro that resolves to either `.slot = fn,` or an empty token sequence:
+- **Build the GPU side in `start()`.** `record_gpu` replaces `process()`, so nothing set up lazily in `process()` would ever run.
+- **Record into the engine's command buffer**: dispatches and the barriers inside your own work. Never begin, end or submit it; the engine does that once for the whole chain.
+- **Outputs come from the engine's ring.** `spc::acquire_ringed_output(pass, port, width, height, stride, format, device_size, staging_size)` gives this frame's slot: point the output binding at `device_buffer`, and set the output frame's `gpu_handle` to the slot's `gpu_handle`, with `SPC_GPU_FLAG_RESIDENT`. When a CPU node reads that output, the engine copies `device_buffer` into the slot's `staging_buffer` in the same submit; `staging_buffer` is null otherwise. The plugin records no download of its own.
+- **A CPU-fed input** goes through `spc::acquire_ringed_upload(pass, port, device_size, staging_size)`: copy the CPU frame into `staging_mapped`, then record the upload into `device_buffer`.
+- **A GPU-resident input** is read where it is: `spc::gpu::buffer_from_host(host, frame->gpu_handle)` gives the buffer behind its handle.
+- **Returns.** A non-zero result cancels the frame for the whole chain, and three in a row move the node to its `process()` path for the rest of the run. `SPC_SKIP` (no frame this time: a stream stall, an exposure in flight) cancels the frame without counting.
 
 ```cpp
 #ifdef SPC_HAS_VULKAN
-  #define MY_RECORD_GPU_SLOT .record_gpu = record_gpu,
-#else
-  #define MY_RECORD_GPU_SLOT
+static int record_gpu(SpcPluginInstance* instance, SpcStep* step, SpcGpuPass* pass)
+{
+    auto* s = state(instance);
+    SpcHost* host = s->host;
+    const SpcData& in_data = step->inputs[0];
+    if (in_data.type != SPC_DATA_FRAME || !in_data.frame || !s->gpu_ready) return SPC_FAILED;
+    const SpcFrame* in = in_data.frame;
+
+    SpcFrame* out = host->frame(host, 0, in->width, in->height, SPC_PIXEL_FORMAT_GRAY8);
+    if (!out) return SPC_FAILED;
+
+    SpcGpuEdgeBuffer ob = spc::acquire_ringed_output(
+        pass, 0, out->width, out->height, out->stride, SPC_PIXEL_FORMAT_GRAY8,
+        s->pipeline.output_size(), s->pipeline.output_size());
+    if (!ob.device_buffer || ob.gpu_handle == 0) {
+        host->release_frame(host, out);
+        return SPC_FAILED;
+    }
+
+    VkBuffer input = VK_NULL_HANDLE;
+    if (in->gpu_handle != 0 && (in->gpu_flags & SPC_GPU_FLAG_RESIDENT))
+        input = spc::gpu::buffer_from_host(host, in->gpu_handle).buffer;
+
+    // the plugin's own pipeline records its dispatches into the engine's command
+    // buffer, writing ob.device_buffer
+    auto cmd = static_cast<VkCommandBuffer>(pass->cmd_buffer_handle);
+    if (!s->pipeline.record(*s->vk_ctx, cmd, *in, input, ob)) {
+        host->release_frame(host, out);
+        return SPC_FAILED;
+    }
+
+    out->gpu_handle = ob.gpu_handle;
+    out->gpu_flags |= SPC_GPU_FLAG_RESIDENT;
+    out->timestamp_ns = in->timestamp_ns;
+    out->sequence = in->sequence;
+    step->outputs[0].type = SPC_DATA_FRAME;
+    step->outputs[0].frame = out;
+    return SPC_OK;
+}
 #endif
 
-SPC_PLUGIN_VTABLE(
-    ...
-    .stop              = stop,
-    MY_RECORD_GPU_SLOT
-    .request_stop      = request_stop
+SPC_EXPORT_PLUGIN(
+    .info           = info,
+    .start          = start,
+    .stop           = stop,
+    .process        = process,   // the CPU path
+    .params_changed = params_changed,
+    SPC_IF_VULKAN(.record_gpu = record_gpu,)
 )
 ```
 
-Slot semantics for the optional trailing slots:
+`examples/wmv_bgs` in the examples repository is a complete RECORDED plugin: its pipeline class, its shaders, its CPU path through spclib, and the upload of a CPU-fed input.
 
-- **`on_input_event`** — GUI interaction handler (mouse/keyboard events for interactive plugins)
-- **`scan_devices`** — hardware device enumeration (called before instance creation)
-- **`on_control_response`** — control channel response handler (LIST/GET replies from upstream nodes, delivered independently from `process()`)
-- **`validate_mandatory`** — conditional mandatory-parameter check; null = host runs default flag-based check
-- **`record_gpu`** — coalesced GPU recording (see [GPU Compute Plugins](#gpu-compute-plugins))
-- **`request_stop`** — pre-drain abort signal (see [Two-Phase Shutdown](#two-phase-shutdown))
+### Frames in flight
 
-### Control Response Callback
+The engine may run a GPU chain several frames deep (the GPU pipeline depth, a setting of the engine), recording frame N+1 while frame N is still on the GPU. A plugin does not need to know how deep. The engine orders the frames on the GPU, and the ring calls hand each frame its own buffers. What no barrier can order is the CPU, and two calls cover it:
 
-Plugins that send control commands (LIST/GET) and need to process the response implement `on_control_response`:
+- `spc::acquire_ringed_scratch(pass, key, kind, size)`: a host-visible buffer per frame in flight, for an upload the plugin fills by `memcpy` (`SPC_GPU_SCRATCH_UPLOAD`) or a readback it reads when the same buffer comes round again (`SPC_GPU_SCRATCH_READBACK`).
+- `spc::release_after_frame(pass, release, arg)`: calls `release(arg)` once every frame recorded so far has finished on the GPU, for what a frame used and the plugin is done with: a decoder's frame, buffers replaced on a resize.
 
-```cpp
-// handler signature: void handler(StateType*, const SpcControlMsg*)
-static void on_ctrl_response(MyState* s, const SpcControlMsg* response) {
-    if (response->msg_type != SPC_CTRL_RESPONSE) return;
-    // process response parameters...
-}
-SPC_PLUGIN_CONTROL_RESPONSE(MyState, on_ctrl_response)
+`pass` stays valid until `stop()` returns, so a plugin may keep it to call `release_after_frame` from `process()`.
+
+### OWN_SUBMIT and OWN_API
+
+An OWN_SUBMIT node gets its GPU-resident input in `record_gpu` too, but records and submits on its own queue, under `lock_queue`, and waits there; it is never fused with its neighbours, so its wait cannot stall a chain. An OWN_API node takes CPU frames and computes through its own API; with a null `gpu()` it takes its CPU path. Both report the GPU time the engine cannot see with `host->gpu_time(host, microseconds)`.
+
+### Building a GPU plugin
+
+```cmake
+spc_add_plugin(my_bgs SOURCES my_bgs_plugin.cpp)
+target_link_libraries(my_bgs PRIVATE SpeculorSDK::spclib)
+
+if(SPC_VULKAN_FOUND AND SPC_GLSLANG_VALIDATOR)
+    spc_enable_gpu(my_bgs)                                 # links the GPU helpers, defines SPC_HAS_VULKAN
+    spc_add_gpu_shaders(my_bgs SHADERS my_compute.comp)    # shaders/my_compute.comp -> my_compute_comp.spv.h
+    target_sources(my_bgs PRIVATE my_gpu_pipeline.h my_gpu_pipeline.cpp)
+endif()
 ```
 
-The response callback is called on the node's own execution thread, separate from `process()`. Control connections are independent from data inputs — they do not affect `input_count` or the process loop.
+`find_package(SpeculorSDK)` sets `SPC_VULKAN_FOUND` and `SPC_GLSLANG_VALIDATOR`: the bundle ships the Vulkan loader and headers and `glslangValidator`. `spc_add_gpu_shaders` expects its shaders in `./shaders/`, and takes `TARGET_ENV vulkan1.2` for shaders that need SPIR-V 1.5. Keep the GPU headers and code under `#ifdef SPC_HAS_VULKAN`, so a build without Vulkan still compiles the CPU path.
+
+`gpu/gpu_pipeline_base.h` holds `GpuPipelineBase`, a base class for compute pipelines. Inside `record_gpu`, `ScopedExternalRecording scope(*this, cmd)` records into the engine's command buffer; `cmd_dispatch_compute`, `cmd_upload_input`, `cmd_download_to_staging` and the `barrier_*` helpers do the common steps. `gpu/gpu_failure_tracker.h` holds a default policy for GPU failures in `process()`: it tears the GPU side down after repeated failures and tells the plugin when to return `SPC_DEVICE_LOST`.
+
+---
+
+## Two-Phase Shutdown
+
+A plugin can block in `process()` on I/O that only an outside event ends: a stalled network stream, a socket with no data, an HTTP request to a server that does not answer. The engine stops a node in two phases so that such a plugin can be stopped in bounded time, and so that teardown never races a step:
+
+| Phase | Slot | When | What the plugin does |
+|---|---|---|---|
+| 1, abort | `interrupt` (optional) | from another engine thread, before the engine waits for the node's thread to leave the plugin; a `process()` or `record_gpu` may be running | Sets flags and cuts blocking I/O. Frees nothing a step reads. Returns at once |
+| 2, teardown | `stop` | after the node's thread has left the plugin | Closes devices, joins threads, frees the instance |
+
+A plugin whose steps cannot block leaves `interrupt` out. One that can block implements it, and ends the blocking call with the means the call offers:
+
+- **FFmpeg**: an `AVIOInterruptCB` that reads the flag `interrupt()` sets. spclib's `video::VideoReader::request_stop()` sets the one it installs.
+- **HTTP through spclib**: `spclib::http::RequestOptions::cancel` points at an `std::atomic<bool>`. Setting it ends a request in flight, stalled or not, within about a second, and a request made while it is set is not sent (`spclib/http/http.hpp`, link `SpeculorSDK::spclib_http`).
+- **Map tiles**: `spc::map::DownloadQueue::interrupt()` (`spc_map_tiles.h`) ends the download in flight and the queue's idle wait. It sets flags only, so it is safe while `process()` runs. The queue's own `stop()`, called from the plugin's `stop()`, joins its worker.
+- **Sockets**: shutting a socket down from another thread does not reliably wake a blocked call on every platform. Wait on the socket with a bounded timeout (`poll`) and check the flag between waits; `examples/udp_scalar_source` does this.
+
+```cpp
+static void interrupt(SpcPluginInstance* instance)
+{
+    auto* s = state(instance);
+    s->stopping.store(true, std::memory_order_release);   // read by process() between waits
+    s->cancel.store(true);                                 // RequestOptions::cancel of the request in flight
+}
+
+static void stop(SpcPluginInstance* instance)
+{
+    auto* s = state(instance);
+    if (s->worker.joinable()) s->worker.join();
+    delete s;
+}
+```
+
+Without `interrupt`, a step blocked on I/O holds up the node's stop until the I/O ends or the engine gives up on the node's thread.
+
+---
+
+## The C++ Composition Layer
+
+The examples write the boundary out. The SDK also has a composition layer for C++ plugins, which builds the two lifecycle slots from smaller functions; Speculor's own plugins use it:
+
+```cpp
+struct MyState {
+    spc::HostServices host;   // the SpcHost, wrapped
+    float gain = 1.0f;
+};
+
+SPC_PLUGIN(MyState, host)   // state(), create_instance(), destroy_instance(), set_host_services()
+
+static int set_parameter(SpcPluginInstance* inst, const char* name, const SpcParameterDesc* v)
+{
+    if (std::strcmp(name, "gain") == 0) state(inst)->gain = v->float_val.value;
+    return 0;
+}
+
+SPC_EXPORT_PLUGIN_SLOTS(
+    .info              = info,
+    .create_instance   = create_instance,
+    .destroy_instance  = destroy_instance,
+    .params_changed    = spc::params_by_name<info, set_parameter>,
+    .process           = process,
+    .set_host_services = set_host_services
+)
+```
+
+- `SPC_EXPORT_PLUGIN_SLOTS(...)` (`plugin_macros.h`) takes `spc::PluginSlots`, in its declaration order: `info`, `create_instance`, `destroy_instance`, `params_changed`, `param_rules`, `list_options`, `process`, `start`, `stop`, `set_host_services`, `ui_input`, `control_reply`, `record_gpu`, `interrupt`.
+- The exported `start(host, values)` is `create_instance`, then `set_host_services`, then `params_changed` with every value, then the slot `start(instance)` (0, or the node does not run). The exported `stop` is the slot `stop(instance)`, then `destroy_instance`. The other slots pass through as they are.
+- `spc::params_by_name<info, set_parameter>` calls `set_parameter(inst, name, value)` once per changed parameter, with the value in the C++ carrier `SpcParameterDesc` (`param_carrier.h`). A third template argument receives LIST parameters as rows (`SPC_PLUGIN_LIST_HANDLER`). `SPC_PLUGIN_AUTO_PARAMS` with `SPC_BIND_*` generates `set_parameter` from field bindings.
+- `spc::HostServices` (`param_dispatch.h`) wraps the host: `frame`, `table`, `take_signal`, `gpu`, `set_int` / `set_float` / `set_choice` / `set_list`, `set_disabled` / `set_range` / `set_options`, `emit_event`, `control(out, request_id)` and the others. `spc::take_signals(host, info(), handler)` hands every waiting signal block to `handler(port, block)`. `spc::ParamRules` writes a `param_rules` function by parameter name.
 
 ---
 
 ## CMake Integration
 
-### Project Setup
+### Project setup
 
-`find_package(SpeculorSDK REQUIRED)` resolves from the extracted bundle and brings in the `SpeculorSDK::` imported targets. It does **not** define the helpers — it only appends the bundle's cmake directory to `CMAKE_MODULE_PATH`, so you include them yourself. A complete plugin project is two files:
-
-**`CMakeLists.txt`**
+`find_package(SpeculorSDK REQUIRED)` resolves from the extracted bundle and brings in the `SpeculorSDK::` targets. It does not include the helpers: it only puts the bundle's cmake directory on `CMAKE_MODULE_PATH`. Include both:
 
 ```cmake
 cmake_minimum_required(VERSION 3.24)
 project(my_plugin LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(SpeculorSDK REQUIRED)
-include(PluginHelpers)      # spc_add_plugin(), spc_add_plugin_test(), spc_enable_gpu()
-include(CompilerWarnings)   # spc_set_warnings(), which spc_add_plugin calls internally
+include(PluginHelpers)      # spc_add_plugin(), spc_add_plugin_test(), spc_enable_gpu(), spc_add_gpu_shaders()
+include(CompilerWarnings)   # spc_set_warnings(), which spc_add_plugin() calls
 
 spc_add_plugin(my_plugin SOURCES my_plugin.cpp)
 ```
 
-Both includes are required. Omitting `PluginHelpers` makes `spc_add_plugin` an unknown command; omitting `CompilerWarnings` fails *inside* `spc_add_plugin` on `spc_set_warnings`, which is a more confusing error because it points into the bundle rather than at your own CMakeLists.
+Without `PluginHelpers`, `spc_add_plugin` is an unknown command. Without `CompilerWarnings`, the configure fails inside `spc_add_plugin` on `spc_set_warnings`.
 
 Configure with `CMAKE_PREFIX_PATH` pointing at the extracted bundle:
 
@@ -1408,61 +1099,56 @@ cmake --build build
 
 ### `spc_add_plugin()`
 
-```cmake
-spc_add_plugin(my_plugin SOURCES my_plugin.cpp)
-```
+`spc_add_plugin(my_plugin SOURCES ...)` makes a shared library that:
 
-This creates a shared library target with the correct settings:
-- Adds the SDK include directories (`include/speculor/` and the shared plugin headers in `include/speculor_common/`)
-- Links against `SpeculorSDK::speculor_sdk`
-- Defines `SPC_PLUGIN_EXPORT` for proper symbol visibility
-- Removes the `lib` prefix (plugins are loaded by name)
-- Sets hidden default visibility, so only the vtable symbol is exported
-- Configures RPATH for runtime dependency resolution against the bundled libraries
-- Applies the SDK's compiler warning set
+- links `SpeculorSDK::speculor_sdk` (the C++ conveniences) and the shared plugin helpers, with their include directories;
+- defines `SPC_PLUGIN_EXPORT`, so `SPC_EXPORT_PLUGIN` exports `spc_plugin`, and hides every other symbol;
+- has no `lib` prefix, since plugins are loaded by name;
+- finds the bundled libraries at run time (RPATH on Linux);
+- builds with the SDK's warning set;
+- lands in `SPC_PLUGIN_OUTPUT_DIR` when you set it.
 
-The build output is a loadable plugin shared library (`my_plugin.dll` / `my_plugin.so`). Drop it into the host application's plugin directory to load it.
-
-### Linking Additional Libraries
-
-The bundle's dependencies are available as imported targets, and you can link your own on top:
+### Linking libraries
 
 ```cmake
-spc_add_plugin(my_plugin SOURCES my_plugin.cpp)
-target_link_libraries(my_plugin PRIVATE SpeculorSDK::spclib)
+target_link_libraries(my_plugin PRIVATE SpeculorSDK::spclib)        # vision: BGS, blobs, flow, tracking, video I/O
+target_link_libraries(my_plugin PRIVATE SpeculorSDK::spclib_http)   # spclib::http
+target_link_libraries(my_plugin PRIVATE ${OpenCV_LIBS})             # the bundled OpenCV
+target_include_directories(my_plugin SYSTEM PRIVATE ${OpenCV_INCLUDE_DIRS})
 ```
 
 ---
 
 ## Testing Your Plugin
 
-The bundle ships a header-only test harness under `include/speculor_common/testing/`. It loads a **built** plugin the way the host does — through its exported `spc_plugin_vtable` — so it exercises the real ABI boundary rather than calling your functions directly. Nothing about it is Speculor-specific at build time: there is no test framework to adopt, and the checks return a report instead of asserting, so they drop into Catch2, GoogleTest, or a bare `main`.
+The bundle ships a test harness in `include/speculor_common/testing/`. It loads a **built** plugin the way the host does, through its exported `spc_plugin`, so it tests the library you ship rather than your functions linked into a test. It uses no test framework: the checks return a report, so they drop into Catch2, GoogleTest or a bare `main`.
 
 | Header | What it gives you |
 |---|---|
-| `<testing/plugin_under_test.h>` | `PluginUnderTest` — RAII load/unload, `create()`/`start()`/`stop()`, parameter and `process()` calls |
-| `<testing/fake_host.h>` | `FakeHost` — an `SpcHostServices` stand-in with a frame pool, captured logs, and a controllable clock |
-| `<testing/conformance.h>` | `run_conformance()` — the checks every plugin must satisfy |
+| `<testing/plugin_under_test.h>` | `PluginUnderTest`: loads the plugin, holds a node's parameter values, and starts, steps, interrupts and stops it |
+| `<testing/fake_host.h>` | `FakeHost`: an `SpcHost` with every function set, a frame pool, lent tables, signal inputs, captured logs and a clock you drive |
+| `<testing/conformance.h>` | `run_conformance()`: the checks every plugin must pass |
 
 ### Conformance
 
-`run_conformance()` is the floor. It verifies the things the host relies on and that are easy to get subtly wrong:
+`run_conformance()` checks what the host relies on:
 
-- `struct_size` matches the vtable the SDK was built with, and the required slots are non-null
-- descriptor strings are NUL-terminated inside their fixed buffers, and counts are within `SPC_PORT_MAX` / `SPC_PLUGIN_PARAM_MAX`
-- every declared parameter is readable by name via `get_parameter` and reports the type it was declared with
-- parameter defaults sit inside their own declared ranges, and names are unique
-- `set_parameter` **rejects** an undeclared name rather than returning `SPC_OK` — otherwise "applied" and "silently ignored" are indistinguishable to the caller, and a typo in a project file becomes a setting that never takes effect
-- create → start → request_stop → stop survives, and a **second** `stop()` is safe, because the host can stop a node that already stopped itself after a fatal error
+- **The export**: `abi` equals the harness's `SPC_ABI`, and `info`, `start` and `stop` are set.
+- **The node info**: no null string, counts within the limits, port and parameter ids unique and not empty, field ids that fit, defaults inside their own ranges, a GPU use that has its `record_gpu` (`descriptor.gpu_records`), and the `.listed()` flag matching `list_options` (`options.listed_match`).
+- **The lifecycle, on the engine's threads**: `start()` and `stop()` on an engine thread, twice in a row; `process()` on a node thread with a blank datum of each input's type; `interrupt()` from a third thread during a step, after which the step returns; a restart; each parameter set to its own default; `param_rules`; an empty block on each signal input; a few UI inputs; `list_options` with refresh on a thread of its own. A call that does not return within 30 s fails.
+- **Outputs**: a table output comes from `host->table()` (`output.table_is_lent`).
+- **Threads**: the rule for each of the 24 host functions (`threads.*`). The host notes the thread every call comes from, so a `frame()` in `start()` or a `log()` from a thread of the plugin's own after `stop()` fails.
 
-A runner is about twenty lines, and takes the plugin path as `argv[1]`:
+A runner takes the plugin's path:
 
 ```cpp
 #include <testing/conformance.h>
 #include <testing/plugin_under_test.h>
+
 #include <cstdio>
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     if (argc < 2) { std::fprintf(stderr, "usage: %s <plugin>\n", argv[0]); return 2; }
 
     spc::testing::PluginUnderTest plugin;
@@ -1478,7 +1164,7 @@ int main(int argc, char** argv) {
 
 ### Registering it
 
-`spc_add_plugin_test()` builds the runner against the SDK, resolving includes and libraries from the bundle and linking `dl` where `dlopen` needs it. Register **one `add_test` per plugin**, so a failure names the plugin instead of reporting that "the tests" broke:
+`spc_add_plugin_test()` builds the runner against the SDK, with the harness on its include path, and links `dl` where `dlopen` needs it. Register one test per plugin, so a failure names the plugin:
 
 ```cmake
 enable_testing()
@@ -1488,478 +1174,110 @@ add_test(NAME conformance.my_plugin COMMAND my_plugin_tests $<TARGET_FILE:my_plu
 set_tests_properties(conformance.my_plugin PROPERTIES TIMEOUT 120)
 ```
 
-Each `PLUGINS` target becomes a build dependency and an `SPC_PLUGIN_<NAME>` compile definition. Naming a target that does not exist is a hard configure error, not a skipped test. Then `ctest --test-dir build --output-on-failure`.
+Each `PLUGINS` target is built first and passed to the test as `SPC_PLUGIN_<NAME>`, its path. A target that does not exist fails the configure. Run the tests with `ctest --test-dir build --output-on-failure`.
 
 ### Beyond conformance
 
-Conformance proves your plugin loads and answers the ABI honestly. It cannot tell whether it does its job — that needs a test written against your own contract, using `FakeHost` to supply host services and `PluginUnderTest::process()` to push data through:
+Conformance proves that a plugin loads and keeps the ABI's rules; it cannot tell whether the plugin does its job. A behaviour test drives it through a `FakeHost` and checks what `process()` produces:
 
 ```cpp
+spc::testing::PluginUnderTest plugin;
+if (!plugin.load(SPC_PLUGIN_MY_PLUGIN)) return 1;
 spc::testing::FakeHost host;
-plugin.set_host_services(host.services());
-plugin.create();
+
+plugin.create();                             // the node, with its parameter values
+host.serve_params(plugin.params());          // the plugin's own set_param calls reach them
+host.serve_tables(plugin.descriptor());      // host->table() lends tables of its outputs
+plugin.set_host_services(host.services());   // the host start() is handed
 plugin.start();
 
-SpcData in{};   /* fill in your input */
-SpcData out{};
-plugin.process(&in, 1, &out, 1);   // then assert on `out`
+SpcParameterDesc gain{};
+plugin.get_parameter("gain", &gain);         // the declaration and its value
+gain.float_val.value = 2.0f;
+plugin.set_parameter("gain", &gain);         // as the host does: params_changed on the instance
+
+SpcData in[1]{};   // fill the input
+SpcData out[1]{};
+plugin.process(in, 1, out, 1);               // then check out[0]
+plugin.stop();
 ```
 
-Install host services **before** `start()`. That is the only order the host produces — node setup installs them, then starts the node — so a plugin that dereferences them in `start()` is correct to do so, and starting without them tests a sequence that cannot occur.
-
-If your plugin needs hardware, the no-device paths are still worth covering, and are where bugs concentrate: scanning with nothing attached, starting with no device selected, and the shutdown sequence. A plugin that blocks forever in `stop()` when the device vanished is a real failure mode, and it reproduces without the device.
+- Hand the host over after `create()` and before `start()`: `start()` gets it, as it gets the engine's.
+- `FakeHost` also gives a test `set_time_ns` / `advance_ns` for the clock, `send_signal` for a signal input, `as_input` to lay out a table as an input receives it, `log_lines()`, `control_commands()`, `disable_frames()` to make `frame()` return null, and `lend_gpu` / `switch_gpu_off` for the GPU.
+- A plugin that needs hardware still has paths worth testing without it: a scan with nothing attached, a start with no device, and the shutdown sequence. A plugin that blocks for ever in `stop()` once its device is gone reproduces without the device.
 
 ---
 
-## Complete Example: A Streaming Counter Source
+## Health and the Watchdog
 
-This example shows a more complex plugin that generates frames with a counter overlay. It demonstrates custom create/destroy, side effects in `set_parameter`, start/stop lifecycle, frame allocation with pool fallback, and logging. It is a generator, so it carries `.data_source()` — its output originates outside the pipeline's dataflow, which is what makes it recordable and replayable.
+The engine watches every node for hangs and crashes, and treats every instance as replaceable:
 
-```cpp
-#include <speculor/plugin_helpers.h>
+- **A crash** in a call into the plugin (a memory fault, an arithmetic fault, an illegal instruction) is caught and logged with the node's name, and the node is restarted with a new instance. An exception that escapes a call is logged the same way and counts as an error.
+- **A hang**: a `process()` that does not return within the node's timeout (10 s, or 30 s for sources and GPU nodes, by default) is abandoned. Its thread is left behind, and the node is restarted with a new instance.
+- **The restart limit**: after a few restarts (3 by default) the node is disabled, and the nodes that depend on it with it. A GPU node out of restarts carries on on its CPU path instead: its `gpu()` is null from then on.
+- **Errors** returned by `process()` back off, from 50 ms up to 5 s. A parameter change retries at once.
 
-#include <chrono>
-#include <cstring>
-#include <thread>
-#include <vector>
+What this asks of a plugin:
 
-struct CounterState {
-    spc::HostServices host;
-
-    // parameters
-    int32_t width = 320;
-    int32_t height = 240;
-    float target_fps = 10.0f;
-
-    // runtime
-    uint64_t frame_count = 0;
-    std::chrono::steady_clock::time_point last_frame_time;
-
-    // fallback buffer (used when pool frame not available)
-    std::vector<uint8_t> buffer;
-    SpcFrame local_frame{};
-};
-
-SPC_PLUGIN_CAST(CounterState)
-SPC_PLUGIN_HOST_SERVICES(CounterState, host)
-
-SPC_PLUGIN_DESCRIPTOR(
-    spc::DescriptorBuilder("counter_source", "Counter Source", "Generators")
-        .author("Speculor").version("0.1.0")
-        .description("Generates frames with a counter value rendered as brightness")
-        .output("image_out", "Image", SPC_DATA_FRAME)
-        .int_param("width", "Width", 64, 1920, 320, 1, "Resolution")
-        .int_param("height", "Height", 64, 1080, 240, 1, "Resolution")
-        .float_param("target_fps", "Target FPS", 1.0f, 120.0f, 10.0f, 1.0f, "Timing")
-        .streaming()
-        .frame_alloc()
-        .data_source()
-)
-
-// --- lifecycle ---------------------------------------------------------------
-
-static SpcPluginInstance* create_instance() {
-    auto* s = new CounterState{};
-    s->buffer.resize(static_cast<size_t>(s->width) * s->height);
-    return reinterpret_cast<SpcPluginInstance*>(s);
-}
-
-static void destroy_instance(SpcPluginInstance* inst) {
-    delete state(inst);
-}
-
-// --- parameters (with side effects on resize) --------------------------------
-
-static int set_parameter(SpcPluginInstance* inst, const char* name,
-                          const SpcParameterDesc* value) {
-    auto* s = state(inst);
-    if (spc::try_set_float(name, value, "target_fps", s->target_fps)) return 0;
-
-    int32_t w = s->width, h = s->height;
-    bool resized = spc::try_set_int(name, value, "width", w)
-                || spc::try_set_int(name, value, "height", h);
-    if (!resized) return -1;
-    s->width = w;
-    s->height = h;
-    s->buffer.resize(static_cast<size_t>(s->width) * s->height);
-    SPC_LOG_INFO(&s->host.cached_log, "Resized to %dx%d", s->width, s->height);
-    return 0;
-}
-
-static int get_parameter(SpcPluginInstance* inst, const char* name,
-                          SpcParameterDesc* out) {
-    auto* s = state(inst);
-    if (spc::try_get_int(name, out, "width", s->width)) return 0;
-    if (spc::try_get_int(name, out, "height", s->height)) return 0;
-    if (spc::try_get_float(name, out, "target_fps", s->target_fps)) return 0;
-    return -1;
-}
-
-// --- streaming ---------------------------------------------------------------
-
-static int start(SpcPluginInstance* inst) {
-    auto* s = state(inst);
-    s->frame_count = 0;
-    s->last_frame_time = std::chrono::steady_clock::now();
-    SPC_LOG_INFO(&s->host.cached_log, "Counter source started (%dx%d @ %.0f fps)",
-                 s->width, s->height, s->target_fps);
-    return 0;
-}
-
-static int stop(SpcPluginInstance* inst) {
-    auto* s = state(inst);
-    SPC_LOG_INFO(&s->host.cached_log, "Counter source stopped (%llu frames)",
-                 static_cast<unsigned long long>(s->frame_count));
-    return 0;
-}
-
-// --- process -----------------------------------------------------------------
-
-static int process(SpcPluginInstance* inst, const SpcData* /*inputs*/,
-                   uint32_t /*input_count*/, SpcData* outputs,
-                   uint32_t output_count) {
-    auto* s = state(inst);
-    if (output_count < 1) return -1;
-
-    // pace to target FPS
-    if (s->target_fps > 0.0f) {
-        auto now = std::chrono::steady_clock::now();
-        auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double>(1.0 / s->target_fps));
-        auto next = s->last_frame_time + interval;
-        if (now < next) std::this_thread::sleep_until(next);
-        s->last_frame_time = std::chrono::steady_clock::now();
-    }
-
-    auto w = static_cast<uint32_t>(s->width);
-    auto h = static_cast<uint32_t>(s->height);
-
-    // try pool allocation first
-    SpcFrame* out = s->host.acquire_frame(0, w, h, SPC_PIXEL_FORMAT_GRAY8);
-
-    uint8_t* dst = out ? out->data : s->buffer.data();
-    uint32_t stride = out ? out->stride : w;
-
-    // render: fill with brightness based on counter
-    uint8_t brightness = static_cast<uint8_t>(s->frame_count % 256);
-    for (uint32_t y = 0; y < h; ++y) {
-        std::memset(dst + y * stride, brightness, w);
-    }
-
-    if (out) {
-        out->frame_number = s->frame_count++;
-        spc::set_frame_output(outputs[0], out);
-    } else {
-        s->local_frame.data = s->buffer.data();
-        s->local_frame.width = w;
-        s->local_frame.height = h;
-        s->local_frame.stride = w;
-        s->local_frame.format = SPC_PIXEL_FORMAT_GRAY8;
-        s->local_frame.frame_number = s->frame_count++;
-        spc::set_frame_output(outputs[0], &s->local_frame);
-    }
-
-    return 0;
-}
-
-SPC_PLUGIN_VTABLE(
-    .get_descriptor    = get_descriptor,
-    .create_instance   = create_instance,
-    .destroy_instance  = destroy_instance,
-    .set_parameter     = set_parameter,
-    .get_parameter     = get_parameter,
-    .process           = process,
-    .start             = start,
-    .stop              = stop,
-    .set_host_services = set_host_services
-)
-```
+- **Reach a working state from the parameters alone.** A restart is `start()` on a new instance: open the device again, rebuild what `stop()` released.
+- **Keep no unguarded global state.** An abandoned instance may still be running on its thread while its replacement starts.
+- **Bound every wait.** Use timeouts on device and network reads. Return `SPC_SKIP` when a wait is a normal drought, and an error for a real failure.
+- **Guard your own threads.** The engine contains faults in calls it makes into the plugin, not on threads the plugin starts itself: a fault there ends the process.
 
 ---
 
-## Shared Plugin Utilities
+## Shared Plugin Headers
 
-The bundle ships a set of header-only plugin-side utilities in `include/speculor_common/`. `spc_add_plugin()` puts that directory on your include path, so you include them unprefixed (e.g. `#include <cv_helpers.h>`, `#include <gpu/gpu_utils.h>`):
+The bundle ships these in `include/speculor_common/`; `spc_add_plugin()` puts that directory on your include path.
 
 | Header | Purpose |
-|--------|---------|
-| `spc_clock.h` | Shared-clock accessors (`spc::clock::now_utc_ns` / `now_mono_ns` / `discipline`) — see [Timestamps and the shared clock](#timestamps-and-the-shared-clock) |
-| `spc_ui_panel.h` | Immediate-mode UI widget system (`spc::ui::Panel`) for rendering interactive control panels directly on video frames. Provides buttons, toggles, spinners, sliders, dropdowns, frequency displays, and grouped layouts — the basis for on-frame control surfaces such as an SDR tuning interface |
-| `spc_ui_theme.h` | Catppuccin Mocha color theme (RGB order) and sizing constants for the UI panel system |
-| `spc_ui_hit.h` | Hit-testing infrastructure for UI panel mouse interaction — fixed-capacity `HitRegionSet` with actions like `Toggle`, `EnumOption`, `SpinnerInc/Dec`, `SliderTrack`, `FreqDisplay` |
-| `cv_helpers.h` | OpenCV bridge: `frame_to_mat()` / `mat_to_frame()` zero-copy wrappers, `cv_type_for_format()` pixel format conversion, `copy_frame_rows()` stride-aware copy |
-| `recording_helpers.h` | Shared recording utilities: `date_folder()` and `timestamp_filename()` for file path generation |
-| `metadata_helpers.h` | `parse_metadata_for_container()` — converts JSON metadata into MP4/MOV container tags (ISO 6709 location, creation_time, artist/comment remapping) |
-| `table_serialize.h` | `serialize_table()` — converts `SpcTable` rows to `nlohmann::json` array using schema field types |
-| `pocketfft_hdronly.h` | Vendored single-header FFT library for spectrum analysis plugins |
-| `gpu/…` | Vulkan GPU helpers — see [GPU Acceleration](#gpu-acceleration-vulkan-compute) |
+|---|---|
+| `cv_helpers.h` | OpenCV and `SpcFrame`: `frame_to_mat()` / `mat_to_frame()` without a copy, `cv_type_for_format()`, stride-aware copies |
+| `gpu/gpu_host.h` | The lent device (`context_from_host`), the buffer behind a GPU handle (`buffer_from_host`), shared buffers |
+| `gpu/gpu_pipeline_base.h` | `GpuPipelineBase`, a base for compute pipelines |
+| `gpu/gpu_utils.h`, `gpu/vulkan_context.h` | Buffer, staging and pipeline helpers, and the `VulkanContext` a plugin works through |
+| `gpu/gpu_failure_tracker.h` | A default policy for GPU failures |
+| `spc_clock.h` | `spc::clock::now_utc_ns` / `now_mono_ns` / `get_time` / `discipline`, over the host's clock functions |
+| `spc_map_tiles.h` | Web-Mercator map tiles: projection, a memory and disk cache, and `spc::map::DownloadQueue` (needs OpenCV and `SpeculorSDK::spclib_http`) |
+| `spc_ui_panel.h`, `spc_ui_hit.h`, `spc_ui_text.h`, `spc_ui_theme.h` | Controls drawn on video frames (buttons, toggles, sliders, dropdowns), their hit testing, outlined text and theme |
+| `fps_meter.h` | Delivered frame rate over a sliding window |
+| `recording_helpers.h`, `metadata_helpers.h` | File naming for recorders, and JSON metadata as container tags |
+| `pocketfft_hdronly.h` | A header-only FFT |
+| `domains/adsb/schema.h` | The ADS-B table schema the ADS-B plugins share |
+| `testing/...` | The test harness ([Testing Your Plugin](#testing-your-plugin)) |
 
-### SDR Parameter Standard (`speculor/sdr_params.h`)
+## SDK Headers
 
-Standardized parameter names for SDR plugins, organized into groups:
+The SDK's headers are in `include/speculor/`:
+
+| Header | Purpose |
+|---|---|
+| `plugin.h` | The whole boundary, in C: `SpcPlugin` and `SPC_EXPORT_PLUGIN`, `SpcNodeInfo`, `SpcHost`, `SpcStep`, `SpcGpuPass`, the data types, results and limits, `SPC_ABI` |
+| `plugin_helpers.h` | The C++ conveniences in one include: the builder, the macros, the helpers below |
+| `plugin_macros.h` | `SPC_PLUGIN_DESCRIPTOR`, `SPC_IF_VULKAN`, `SPC_EXPORT_PLUGIN_SLOTS` and the composition layer's macros |
+| `descriptor_builder.h` | `spc::DescriptorBuilder` |
+| `param_dispatch.h` | `spc::log_context`, `spc::ControlOut`, `spc::HostServices`, the ring call wrappers, `spc::params_by_name`, `spc::ParamRules` |
+| `io_helpers.h` | `spc::input_frame` / `input_table` / `input_json` / `input_scalar` and the `set_*_output` helpers |
+| `table_helpers.h` | Schema offsets and the typed table accessors |
+| `schema_storage.h` | `spc::SchemaStorage`, a schema that owns its fields |
+| `plugin_log.h` | `SpcLogContext`, `spc_log` and the `SPC_LOG_*` macros |
+| `decimal_helpers.h` | `SpcDecimal` construction and formatting |
+| `ring_buffer.h` | A lock-free single-producer, single-consumer ring buffer |
+| `spclib_log_bridge.h` | Routes spclib's log to the node's |
+| `sdr_params.h`, `sdr_source_helpers.h` | Standard SDR parameter names, and helpers for SDR sources |
+| `geo_math.h`, `camera_params.h`, `astro_coords.h` | Geodesy, camera models and astronomical coordinates |
+| `version.h` | `SPC_SDK_VERSION` and its parts |
+
+### SDR parameter names
+
+`speculor/sdr_params.h` names the parameters SDR sources share, so a control panel can drive any of them by name:
 
 | Group | Parameters |
-|-------|-----------|
-| **Tuning** | `center_freq`, `sample_rate`, `bandwidth`, `ddc1_type` |
-| **Demodulator** | `demod_mode`, `demod_bw`, `demod_freq_offset`, `demod_filter_shift`, `demod_filter_length` |
-| **Gain** | `agc_enabled`, `agc_speed`, `mgc_gain`, `max_agc_gain`, `attenuator`, `preamplifier` |
-| **Filters** | `squelch_level`, `notch_enabled/freq/bw/length`, `noise_blanker`, `adc_nb_threshold` |
-| **Hardware** | `dithering`, `ext_reference`, `inverted`, `channel`, `mw_filter`, `led_mode`, `direct_sampling`, `bias_tee`, `freq_correction` |
+|---|---|
+| Tuning | `center_freq`, `sample_rate`, `bandwidth`, `ddc1_type` |
+| Demodulator | `demod_mode`, `demod_bw`, `demod_freq_offset`, `demod_filter_shift`, `demod_filter_length` |
+| Gain | `agc_enabled`, `agc_speed`, `mgc_gain`, `max_agc_gain`, `attenuator`, `preamplifier` |
+| Filters | `squelch_level`, `notch_enabled`, `notch_freq`, `notch_bw`, `notch_length`, `noise_blanker`, `adc_nb_threshold` |
+| Hardware | `dithering`, `ext_reference`, `inverted`, `channel`, `mw_filter`, `led_mode`, `direct_sampling`, `bias_tee`, `freq_correction` |
 
-The SDR Control Panel plugin discovers available parameters dynamically via the parameter list — SDR source plugins only declare what their hardware supports and the control panel adapts automatically.
-
----
-
-## Best Practices
-
-### ABI Safety
-
-- Never pass C++ types (`std::string`, `std::vector`, classes with vtables) across the plugin boundary. The ABI uses only POD types and fixed-size buffers.
-- Use `extern "C"` linkage for all exported symbols. The `SPC_PLUGIN_VTABLE` macro handles this.
-- Do not store pointers to host memory beyond the lifetime of the call that provided them (except `SpcHostServices`, which is valid for the plugin instance lifetime).
-
-### Memory Management
-
-- Free everything you allocate. Call `spc_table_free()` in `destroy_instance()` for any tables initialized with `spc_table_init()`.
-- Release acquired frames that you decide not to use as output: `s->host.release_frame(frame)`.
-- Use RAII containers (`std::vector`, `std::unique_ptr`) inside your state struct. The `delete` in `destroy_instance()` will call the destructor.
-
-### Performance
-
-- Precompute field offsets in `create_instance()`, not in `process()`. The `spc_schema_compute_offsets()` call is not free.
-- Use pool frames (`.frame_alloc()`) to avoid a copy on the output path.
-- Minimize allocations in `process()`. Pre-allocate buffers in `create_instance()` or resize them lazily.
-- For signal producers, batch samples (64-8192 per call) rather than calling `on_signal` per sample.
-
-### Thread Safety
-
-- `process()` is called from the engine's worker thread. It is safe to access your state struct without locks — the engine guarantees single-threaded access to each instance's `process()`.
-- `set_parameter()` and `get_parameter()` are called from the UI thread (and from other nodes' threads via the control channel) **concurrently** with `process()`. Writing plain state fields from `set_parameter` while `process()` reads them is a data race — undefined behavior even for `int32_t`/`float`. Keep every parameter field that `process()` reads in one POD block held in `spc::SharedParams<T>` (`param_dispatch.h`): `set_parameter` mutates it via `update()` with the usual `try_set_*` helpers, `process()` copies it once per frame via `snapshot()`. Snapshotting once per frame also guarantees all reads within the frame agree (no check/use gaps between a count loop and a fill loop).
-- Never call into stateful processing objects (detectors, trackers, prepared statements, encoders) from `set_parameter` — they're owned by the worker. Set a `std::atomic<bool>` dirty flag and apply the snapshotted parameters from `process()`.
-- `on_signal()` is called from the producer's thread. Use `SpcRingBuffer` (lock-free SPSC) to decouple it from `process()`.
-
-### Error Handling
-
-- Return `0` for success, `-1` for failure from `process()`, `set_parameter()`, `get_parameter()`, `start()`, `stop()`, and `on_signal()`.
-- Check `input_count` and `output_count` before accessing arrays.
-- Use the `spc::input_*` helpers — they return `nullptr` or a default value when the index is out of range or the type does not match.
-- Log errors with `SPC_LOG_ERROR` to help users diagnose pipeline issues.
-
-### Plugin Health & the Watchdog
-
-The engine runs a **NodeWatchdog** thread that monitors every node for hangs and crashes. Plugin authors should be aware of the following:
-
-- **Hang detection**: If `process()` does not return within the configured timeout (default 10s for filters, 30s for sources and GPU plugins), the engine considers the node hung. It will automatically abandon the stuck thread, create a fresh plugin instance, and restart the node. This means your plugin may be re-instantiated (`create_instance` → `set_host_services` → `start` → `process`) at any time during pipeline execution.
-- **Crash detection**: If `process()` crashes (access violation on Windows, segfault on POSIX), the engine catches the exception, marks the node as crashed, and performs the same restart sequence.
-- **Restart limit**: After a configurable number of restart attempts (default 3), the node is permanently disabled and downstream nodes are cascade-disabled. The user sees a health event in the UI.
-- **Design for restartability**: Avoid storing state that cannot be reconstructed from parameters alone. If your plugin initializes hardware (cameras, serial ports), ensure `start()` can open the device cleanly even if a previous instance was abandoned.
-- **Avoid blocking indefinitely in `process()`**: Use timeouts on I/O operations (socket reads, device reads). If you must wait, check periodically and return `SPC_NO_DATA` when the wait is a normal input drought (the engine retries after a short fixed poll with no error state), or an error code for genuine failures (the engine's backoff mechanism retries with exponential delay).
-- **No global mutable state**: If two instances of your plugin exist simultaneously (the old hung instance on a detached thread, plus the new replacement), they must not corrupt each other via shared globals. Use per-instance state exclusively.
-
-In short, the watchdog treats every node as replaceable: it tracks per-node liveness, and on a hang or crash it abandons the instance, builds a fresh one through the normal lifecycle, and counts the restart against a limit before disabling the node and cascading downstream. Nothing about that sequence is visible to a correctly written plugin beyond the requirement that a fresh instance must be able to reach a working state from its parameters alone.
-
----
-
-## SDK Reference
-
-### Limits
-
-| Constant | Value | Meaning |
-|----------|-------|---------|
-| `SPC_PORT_MAX` | 16 | Maximum ports per plugin |
-| `SPC_PLUGIN_PARAM_MAX` | 64 | Maximum parameters per plugin |
-| `SPC_PARAM_NAME_MAX` | 64 | Maximum parameter/port name length |
-| `SPC_PARAM_STRING_MAX` | 256 | Maximum string parameter value length |
-| `SPC_PARAM_TEXT_MAX` | 4096 | Maximum multi-line text parameter length |
-| `SPC_PARAM_ENUM_MAX` | 32 | Maximum enum options per parameter |
-| `SPC_PARAM_ENUM_LABEL_MAX` | 32 | Maximum enum label length |
-| `SPC_SCHEMA_MAX_FIELDS` | 48 | Maximum fields per table/signal schema |
-| `SPC_FIELD_NAME_MAX` | 64 | Maximum field name length |
-| `SPC_CONTROL_MSG_MAX` | 64 | Maximum parameter entries per control message (= `SPC_PLUGIN_PARAM_MAX`) |
-| `SPC_LIST_COL_MAX` / `SPC_LIST_ROW_MAX` | 8 / 256 | Maximum columns / rows per list parameter |
-
-### Process Input/Output Helpers
-
-```cpp
-// input extraction (return nullptr/default if index out of range or type mismatch)
-const SpcFrame*      spc::input_frame(const SpcData* inputs, uint32_t count, uint32_t index);
-const SpcTable*      spc::input_table(const SpcData* inputs, uint32_t count, uint32_t index);
-const SpcRecord*     spc::input_record(const SpcData* inputs, uint32_t count, uint32_t index);
-const SpcPacket*     spc::input_packet(const SpcData* inputs, uint32_t count, uint32_t index);
-float                spc::input_scalar(const SpcData* inputs, uint32_t count, uint32_t index,
-                                       float default_val = 0.0f);
-bool                 spc::input_scalar_bool(const SpcData* inputs, uint32_t count, uint32_t index,
-                                            bool default_val = false);
-SpcScalar            spc::input_scalar_typed(const SpcData* inputs, uint32_t count, uint32_t index);
-const SpcControlMsg* spc::input_control_msg(const SpcData* inputs, uint32_t count, uint32_t index);
-
-// output assignment (set_scalar_output is overloaded for float/double/int32/uint32/
-// int64/uint64/SpcScalar; set_scalar_output_bool for bools)
-void spc::set_frame_output(SpcData& out, SpcFrame* frame);
-void spc::set_table_output(SpcData& out, SpcTable* table);
-void spc::set_scalar_output(SpcData& out, float value);
-void spc::set_record_output(SpcData& out, SpcRecord* record);
-void spc::set_packet_output(SpcData& out, SpcPacket* packet);
-```
-
-`SpcControlMsg` supersedes the older `SpcParamCmd` name. The old spellings remain as aliases (`spc::input_param_cmd`, `using SpcParamCmd = SpcControlMsg`) so existing plugin sources keep compiling — prefer the `control_msg` names in new code.
-
-### Table Helper Functions
-
-```c
-// schema inspection
-void     spc_schema_compute_offsets(const SpcPortSchema* schema,
-                                    uint32_t* offsets_out, uint32_t* stride_out);
-uint32_t spc_field_byte_size(SpcFieldType type);
-uint32_t spc_schema_field_offset(const SpcPortSchema* schema, const char* field_name);
-
-// lifecycle
-void spc_table_init(SpcTable* table, uint32_t stride, const SpcPortSchema* schema);
-int  spc_table_resize(SpcTable* table, uint32_t record_count);
-void spc_table_clear(SpcTable* table);
-void spc_table_free(SpcTable* table);
-
-// typed accessors (field_offset from spc_schema_compute_offsets or spc_schema_field_offset)
-float    spc_table_get_float(const SpcTable*, uint32_t record, uint32_t field_offset);
-int32_t  spc_table_get_int32(const SpcTable*, uint32_t record, uint32_t field_offset);
-uint32_t spc_table_get_uint32(const SpcTable*, uint32_t record, uint32_t field_offset);
-int32_t  spc_table_get_bool(const SpcTable*, uint32_t record, uint32_t field_offset);
-int8_t   spc_table_get_int8(const SpcTable*, uint32_t record, uint32_t field_offset);
-uint8_t  spc_table_get_uint8(const SpcTable*, uint32_t record, uint32_t field_offset);
-int16_t  spc_table_get_int16(const SpcTable*, uint32_t record, uint32_t field_offset);
-uint16_t spc_table_get_uint16(const SpcTable*, uint32_t record, uint32_t field_offset);
-double   spc_table_get_float64(const SpcTable*, uint32_t record, uint32_t field_offset);
-
-void spc_table_set_float(SpcTable*, uint32_t record, uint32_t field_offset, float value);
-void spc_table_set_int32(SpcTable*, uint32_t record, uint32_t field_offset, int32_t value);
-void spc_table_set_uint32(SpcTable*, uint32_t record, uint32_t field_offset, uint32_t value);
-void spc_table_set_bool(SpcTable*, uint32_t record, uint32_t field_offset, int32_t value);
-void spc_table_set_int8(SpcTable*, uint32_t record, uint32_t field_offset, int8_t value);
-void spc_table_set_uint8(SpcTable*, uint32_t record, uint32_t field_offset, uint8_t value);
-void spc_table_set_int16(SpcTable*, uint32_t record, uint32_t field_offset, int16_t value);
-void spc_table_set_uint16(SpcTable*, uint32_t record, uint32_t field_offset, uint16_t value);
-void spc_table_set_float64(SpcTable*, uint32_t record, uint32_t field_offset, double value);
-```
-
-### Ring Buffer Functions
-
-```c
-SpcRingBuffer* spc_ring_create(uint32_t capacity, uint32_t element_size);
-void           spc_ring_destroy(SpcRingBuffer* rb);
-void           spc_ring_reset(SpcRingBuffer* rb);
-uint32_t       spc_ring_write(SpcRingBuffer* rb, const void* src, uint32_t count);
-uint32_t       spc_ring_read(SpcRingBuffer* rb, void* dst, uint32_t count);
-uint32_t       spc_ring_peek(const SpcRingBuffer* rb, void* dst, uint32_t count);
-uint32_t       spc_ring_available(const SpcRingBuffer* rb);
-uint32_t       spc_ring_free(const SpcRingBuffer* rb);
-```
-
-### Color Helpers
-
-```cpp
-void     spc::color_unpack(uint32_t rgba, uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& a);
-uint32_t spc::color_pack(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255);
-```
-
-### SDK Version
-
-```cpp
-std::string ver = spc::format_sdk_version(SPC_SDK_VERSION);  // e.g. "0.22.0"
-```
-
-`version.h` also exposes `SPC_SDK_VERSION_MAJOR` / `_MINOR` / `_PATCH` for compile-time feature gating against a minimum SDK.
-
-### Host Services Struct
-
-```c
-typedef struct {
-    uint32_t          struct_size;      // sizeof(SpcHostServices) for forward compat
-    SpcAcquireFrameFn acquire_frame;    // NULL if plugin doesn't use frames
-    SpcReleaseFrameFn release_frame;    // NULL if plugin doesn't use frames
-    SpcLogCallbackFn  log;              // NULL if host doesn't provide logging
-    void*             host_ctx;         // single opaque context for all callbacks
-    // ... GPU-frame, list-change, and display-size callbacks (see plugin_api.h) ...
-    SpcNowMonoNsFn       now_mono_ns;     // shared clock: monotonic ns
-    SpcNowUtcNsFn        now_utc_ns;      // shared clock: disciplined UTC ns
-    SpcGetTimeFn         get_time;        // shared clock: full reading + sync status
-    SpcDisciplineClockFn discipline_clock;// feed a correction (GPS+PPS / NTP)
-} SpcHostServices;
-```
-
-Read the clock through the `spc_clock.h` helper (see *Timestamps and the shared clock*) rather than calling these pointers directly. The struct is `struct_size`-versioned, so these fields are absent on a pre-0.14 host and the helper falls back to the system clock.
-
-The C++ wrapper `spc::HostServices` provides a convenient interface:
-
-```cpp
-struct HostServices {
-    const SpcHostServices* svc = nullptr;
-    SpcLogContext cached_log{};   // populated by SPC_PLUGIN_HOST_SERVICES macro
-
-    SpcFrame* acquire_frame(uint32_t port, uint32_t w, uint32_t h, SpcPixelFormat fmt);
-    void release_frame(SpcFrame* frame);
-};
-```
-
-### Control Message Helpers
-
-For plugins that send parameter control commands to downstream nodes (`control_msg_helpers.h`, pulled in by `plugin_helpers.h`):
-
-```cpp
-SpcControlMsg cmd{};
-spc::control_msg_clear(&cmd);
-spc::param_cmd_set_int(&cmd, "threshold", 50);
-spc::param_cmd_set_float(&cmd, "gain", 1.5f);
-spc::param_cmd_set_float64(&cmd, "precise_gain", 1.5);
-spc::param_cmd_set_bool(&cmd, "enabled", true);
-spc::param_cmd_set_enum(&cmd, "mode", 2);
-spc::param_cmd_set_color(&cmd, "tint", 0xFF0000FF);
-spc::param_cmd_set_trigger(&cmd, "reset");
-spc::param_cmd_set_decimal(&cmd, "price", spc::spc_decimal_make(19999, 2));
-```
-
-Each setter returns `false` if the message is full (`SPC_CONTROL_MSG_MAX` entries).
-
----
-
-## GPU Acceleration (Vulkan Compute)
-
-Plugins can optionally use Vulkan compute shaders for GPU acceleration. The bundled `speculor_gpu` library (headers under `include/speculor_common/gpu/`, included as `<gpu/...>`) provides a `VulkanContext` singleton and utility functions for buffer management, pipeline creation, and command submission.
-
-### Enabling GPU for a Plugin
-
-In your `CMakeLists.txt`:
-
-```cmake
-spc_add_plugin(my_plugin SOURCES my_plugin.cpp)
-
-if(SPC_VULKAN_FOUND AND SPC_GLSLANG_VALIDATOR)
-    spc_enable_gpu(my_plugin)                              # links speculor_gpu + Vulkan, defines SPC_HAS_VULKAN
-    spc_add_gpu_shaders(my_plugin SHADERS my_compute.comp) # compiles GLSL→SPIR-V, embeds as C header
-    target_sources(my_plugin PRIVATE my_gpu_pipeline.h my_gpu_pipeline.cpp)
-endif()
-```
-
-### Key Files
-
-| Header / module | Purpose |
-|------|---------|
-| `<gpu/vulkan_context.h>` | Shared `VulkanContext` — Vulkan instance, device, compute queue |
-| `<gpu/gpu_pipeline_base.h>` | Base class with dispatch, staging, barrier, timing helpers |
-| `<gpu/gpu_output_handle.h>` | RAII wrapper for buffer registry handle lifecycle (legacy / `gpu_own_submit()` paths) |
-| `<gpu/gpu_ring_output.h>` | `RingOutput` — K-deep edge ring for frames in flight |
-| `<gpu/gpu_utils.h>` | Buffer creation, staging, pipeline creation, command helpers |
-| `<gpu/gpu_buffer_registry.h>` | Singleton registry mapping opaque handles to Vulkan buffers |
-| `<gpu/gpu_failure_tracker.h>` | Standard device-lost / transient-failure policy |
-| `PluginHelpers.cmake` | `spc_enable_gpu()` and `spc_add_gpu_shaders()` macros |
-| `embed_spirv.cmake` | Converts SPIR-V binaries to C uint32_t array headers |
-
-### GPU Plugin Conventions
-
-Whatever the algorithm — background subtraction, dense optical flow, geometric warps, color conversion — GPU plugins built on this API follow the same conventions:
-
-- Publish GPU-resident output through the engine's K-deep edge ring (`acquire_ringed_output`); the engine owns the staging copy and records it only when an edge has a CPU consumer. `GpuOutputHandle` is retained only for legacy / `gpu_own_submit()` paths.
-- Use `cmd_dispatch_compute<T>()` for boilerplate-free shader dispatch
-- Record into the engine's secondary command buffer via `record_gpu` + `ScopedExternalRecording`, and do eager init in `start()`
-- Check `submit_and_wait()` / `submit_and_spin()` returns and disable GPU on persistent failure
-- Expose the engine-managed `gpu_enabled` parameter via `.gpu_compute()` (stop-only toggle, default: true)
-- Fall back to CPU when Vulkan is unavailable or the GPU fails
+A source declares only what its hardware supports; a control panel finds what is there with a control LIST.
