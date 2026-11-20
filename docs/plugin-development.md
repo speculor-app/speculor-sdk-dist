@@ -143,7 +143,7 @@ What each part does:
 | `info` | yes | Returns the node info. Called once, when the library is discovered |
 | `start` | yes | Makes an instance from the host and every parameter value |
 | `stop` | yes | Tears the instance down and frees it |
-| `process` | | Runs one step |
+| `process` | yes | Runs one step |
 | `interrupt` | | Phase 1 of shutdown: cut blocking I/O ([Two-Phase Shutdown](#two-phase-shutdown)) |
 | `params_changed` | | Tells a running instance the values again |
 | `record_gpu` | for `SPC_GPU_RECORDED` and `SPC_GPU_OWN_SUBMIT` | Records one step's GPU work ([GPU Plugins](#gpu-plugins)) |
@@ -265,7 +265,7 @@ library loaded, abi checked
 | `interrupt` | any engine thread, before the engine waits for the node's thread | a step in progress |
 | `stop` | an engine thread, after the node's thread left the plugin | nothing |
 | `param_rules` | any thread, any time; no instance | anything |
-| `list_options` | off the host's GUI thread; no instance | anything |
+| `list_options` | any thread; no instance | anything |
 
 The engine calls an instance one call at a time, `interrupt` aside, so the plugin needs no lock for its own state on the engine's account. `start()` and `stop()` run on an engine thread, not the node's: anything a plugin sets up per thread (a thread-local log sink, a COM apartment) belongs at the top of `process()`.
 
@@ -463,7 +463,7 @@ static void param_rules(const SpcValue* values, uint32_t* states)
 
 ### Listing options
 
-An ENUM whose options are found only by looking (devices, serial ports, files) is flagged `.listed()`, and the plugin implements `list_options`. It has no instance and runs off the GUI thread:
+An ENUM whose options are found only by looking (devices, serial ports, files) is flagged `.listed()`, and the plugin implements `list_options`. It has no instance and may be called on any thread:
 
 ```cpp
 static int list_options(uint32_t param, const SpcValue* /*values*/, int refresh,
